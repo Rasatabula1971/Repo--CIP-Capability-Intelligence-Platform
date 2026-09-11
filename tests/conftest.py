@@ -13,6 +13,9 @@ from db.connection import connect
 from db import migrate
 
 TABLES_IN_TRUNCATE_ORDER = [
+    "experience_score",
+    "failure_event",
+    "component_project_use",
     "verification_assertion",
     "verification_run",
     "workflow_template_step",

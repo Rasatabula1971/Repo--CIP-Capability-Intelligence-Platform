@@ -371,6 +371,84 @@ def verification_status(
 
 
 @mcp.tool()
+def experience_summary(
+    project_id: str,
+    capability_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Get the experience summary for a capability within a project.
+
+    Shows how well a component has worked in practice: active uses,
+    failure count, experience score, and a recommendation (continue,
+    monitor, or consider_replacement).
+
+    Args:
+      project_id: UUID of the project.
+      capability_id: UUID of the capability.
+
+    Returns {capability_id, normalized_key, project_id, active_uses,
+    total_failures, unresolved_failures, experience_score, recommendation,
+    uses[], failures[]}. recommendation is one of 'continue', 'monitor',
+    'consider_replacement', or 'not_used'.
+    """
+    conn = connect()
+    try:
+        return queries.experience_summary(
+            conn,
+            project_id=project_id,
+            capability_id=capability_id,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def find_replacement(
+    project_id: str,
+    capability_id: str,
+    failure_kind: str = "other",
+    severity: str = "error",
+    summary: str = "",
+    limit: int = 10,
+) -> Optional[dict[str, Any]]:
+    """
+    Diagnose a component failure and find replacement candidates.
+
+    When a component fails in a project, this tool analyzes the failure,
+    determines urgency, and searches for alternatives — excluding the
+    failed component and ranking by registry score + project experience.
+
+    Args:
+      project_id: UUID of the project where the failure occurred.
+      capability_id: UUID of the failed capability.
+      failure_kind: type of failure — 'install_failure', 'import_failure',
+        'runtime_error', 'security_vulnerability', 'api_breaking_change',
+        'dependency_conflict', 'build_failure', 'test_failure',
+        'performance_degradation', 'other'.
+      severity: 'warning', 'error', or 'critical'.
+      summary: free-text description of the failure.
+      limit: max replacement candidates to return (default 10).
+
+    Returns {failed_capability_id, normalized_key, diagnosis, recommendation,
+    candidates[]}. recommendation is one of 'replace_immediately',
+    'replace_soon', 'monitor_and_plan', or 'no_alternatives_found'.
+    """
+    conn = connect()
+    try:
+        return queries.find_replacement(
+            conn,
+            project_id=project_id,
+            capability_id=capability_id,
+            failure_kind=failure_kind,
+            severity=severity,
+            summary=summary,
+            limit=limit,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def capability_detail(capability_id: str) -> Optional[dict[str, Any]]:
     """
     Full record for one capability.
@@ -462,6 +540,74 @@ def scaffold_pipeline(
     if name:
         proposal = {**proposal, "name": name}
     return scaffold(dict(proposal), Path(out_dir))
+
+
+@mcp.tool()
+def import_requirements(
+    project_id: str,
+    yaml_text: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Import requirements from a YAML spec into a project.
+
+    Parses the YAML, creates or updates project_requirement rows and
+    their requirement_constraint children. Existing requirements with
+    the same slug are updated (constraints replaced).
+
+    Args:
+      project_id: UUID of the project to import into.
+      yaml_text: YAML string with the requirements spec. Format:
+        requirements:
+          - slug: http-client
+            description: "Need an HTTP client"
+            constraints:
+              - kind: required_interface
+                name: get
+              - kind: license_allowlist
+                spdx_ids: [MIT, Apache-2.0]
+
+    Returns {project_id, created, updated, total, requirements[]}
+    or None if project_id is malformed/missing.
+    """
+    conn = connect()
+    try:
+        return queries.import_requirements(
+            conn,
+            project_id=project_id,
+            yaml_text=yaml_text,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def requirement_coverage(
+    project_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Requirement coverage report for a project.
+
+    Shows each requirement and whether it has: a recommendation,
+    a verification run on the recommended version, and experience
+    data. Provides aggregate coverage percentage.
+
+    Args:
+      project_id: UUID of the project.
+
+    Returns {project_id, total_requirements, covered, verified,
+    with_experience, coverage_pct, requirements[]} where each
+    requirement has {slug, description, constraint_count,
+    has_recommendation, verdict, has_verification,
+    verification_result, has_experience, experience_score}.
+    """
+    conn = connect()
+    try:
+        return queries.requirement_coverage(
+            conn,
+            project_id=project_id,
+        )
+    finally:
+        conn.close()
 
 
 def main() -> None:

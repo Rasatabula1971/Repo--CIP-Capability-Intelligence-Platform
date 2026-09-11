@@ -20,6 +20,7 @@ but the names disambiguate.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any, Optional
 
@@ -1184,6 +1185,657 @@ def verification_status(
         "display_version": head.get("display_version", ""),
         "verified": latest_passed,
         "runs": runs,
+    })
+
+
+# ---------------------------------------------------------------------------
+# experience memory — Phase 5
+# ---------------------------------------------------------------------------
+
+def record_component_use(
+    conn,
+    project_id: str,
+    capability_id: str,
+    capability_version_id: str | None = None,
+    recommendation_id: str | None = None,
+    verification_run_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Record that a project adopted a capability."""
+    try:
+        proj_uuid = uuid.UUID(project_id)
+        cap_uuid = uuid.UUID(capability_id)
+    except (ValueError, TypeError):
+        return None
+
+    ver_uuid = None
+    if capability_version_id:
+        try:
+            ver_uuid = uuid.UUID(capability_version_id)
+        except (ValueError, TypeError):
+            pass
+
+    rec_uuid = None
+    if recommendation_id:
+        try:
+            rec_uuid = uuid.UUID(recommendation_id)
+        except (ValueError, TypeError):
+            pass
+
+    vrun_uuid = None
+    if verification_run_id:
+        try:
+            vrun_uuid = uuid.UUID(verification_run_id)
+        except (ValueError, TypeError):
+            pass
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO component_project_use "
+            "(project_id, capability_id, capability_version_id, "
+            " recommendation_id, verification_run_id) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (proj_uuid, cap_uuid, ver_uuid, rec_uuid, vrun_uuid),
+        )
+        use_id = cur.fetchone()[0]
+    conn.commit()
+
+    return _json_safe({
+        "use_id": str(use_id),
+        "project_id": project_id,
+        "capability_id": capability_id,
+        "status": "active",
+    })
+
+
+def retire_component_use(
+    conn,
+    use_id: str,
+    reason: str = "",
+    status: str = "retired",
+) -> dict[str, Any] | None:
+    """Mark a component use as retired/replaced/failed."""
+    try:
+        use_uuid = uuid.UUID(use_id)
+    except (ValueError, TypeError):
+        return None
+
+    if status not in ("retired", "replaced", "failed"):
+        status = "retired"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE component_project_use "
+            "SET status = %s, retired_at = now(), retirement_reason = %s "
+            "WHERE id = %s AND status = 'active' "
+            "RETURNING id, status",
+            (status, reason, use_uuid),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    conn.commit()
+    return {"use_id": use_id, "status": status, "reason": reason}
+
+
+def log_failure_event(
+    conn,
+    use_id: str,
+    failure_kind: str,
+    severity: str = "error",
+    summary: str = "",
+    detail: str = "",
+) -> dict[str, Any] | None:
+    """Record a failure event for a component use."""
+    try:
+        use_uuid = uuid.UUID(use_id)
+    except (ValueError, TypeError):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO failure_event "
+            "(component_use_id, failure_kind, severity, summary, detail) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (use_uuid, failure_kind, severity, summary, detail),
+        )
+        event_id = cur.fetchone()[0]
+    conn.commit()
+
+    return _json_safe({
+        "event_id": str(event_id),
+        "use_id": use_id,
+        "failure_kind": failure_kind,
+        "severity": severity,
+    })
+
+
+def resolve_failure_event(
+    conn,
+    event_id: str,
+    resolution: str = "",
+) -> dict[str, Any] | None:
+    """Mark a failure event as resolved."""
+    try:
+        ev_uuid = uuid.UUID(event_id)
+    except (ValueError, TypeError):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE failure_event "
+            "SET resolved_at = now(), resolution = %s "
+            "WHERE id = %s AND resolved_at IS NULL "
+            "RETURNING id",
+            (resolution, ev_uuid),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    conn.commit()
+    return {"event_id": event_id, "resolved": True, "resolution": resolution}
+
+
+def _update_experience_score(
+    conn,
+    project_id: uuid.UUID,
+    capability_id: uuid.UUID,
+) -> None:
+    """Recompute and upsert the experience score for a (project, capability) pair."""
+    from core.project.experience import (
+        ExperienceScoreInput,
+        compute_experience_score,
+    )
+    import datetime
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM component_project_use "
+            "WHERE project_id = %s AND capability_id = %s",
+            (project_id, capability_id),
+        )
+        total_uses = cur.fetchone()[0]
+
+        cur.execute(
+            "SELECT COUNT(*) FROM failure_event fe "
+            "JOIN component_project_use cpu ON cpu.id = fe.component_use_id "
+            "WHERE cpu.project_id = %s AND cpu.capability_id = %s",
+            (project_id, capability_id),
+        )
+        total_failures = cur.fetchone()[0]
+
+        cur.execute(
+            "SELECT MAX(fe.occurred_at) FROM failure_event fe "
+            "JOIN component_project_use cpu ON cpu.id = fe.component_use_id "
+            "WHERE cpu.project_id = %s AND cpu.capability_id = %s",
+            (project_id, capability_id),
+        )
+        last_failure_at = cur.fetchone()[0]
+
+        cur.execute(
+            "SELECT MAX(adopted_at) FROM component_project_use "
+            "WHERE project_id = %s AND capability_id = %s AND status = 'active'",
+            (project_id, capability_id),
+        )
+        last_success_at = cur.fetchone()[0]
+
+    inp = ExperienceScoreInput(
+        total_uses=total_uses,
+        total_failures=total_failures,
+        last_failure_at=last_failure_at,
+        last_success_at=last_success_at,
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    result = compute_experience_score(inp, now=now)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO experience_score "
+            "(project_id, capability_id, total_uses, total_failures, "
+            " success_rate, last_failure_at, last_success_at, score) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (project_id, capability_id) "
+            "DO UPDATE SET "
+            "  total_uses = EXCLUDED.total_uses, "
+            "  total_failures = EXCLUDED.total_failures, "
+            "  success_rate = EXCLUDED.success_rate, "
+            "  last_failure_at = EXCLUDED.last_failure_at, "
+            "  last_success_at = EXCLUDED.last_success_at, "
+            "  score = EXCLUDED.score, "
+            "  updated_at = now()",
+            (
+                project_id, capability_id,
+                result.total_uses, result.total_failures,
+                result.success_rate,
+                last_failure_at, last_success_at,
+                result.score,
+            ),
+        )
+    conn.commit()
+
+
+def experience_summary(
+    conn,
+    project_id: str,
+    capability_id: str,
+) -> dict[str, Any] | None:
+    """
+    Get the experience summary for a capability within a project.
+    Includes active uses, failures, experience score, and recommendation.
+    """
+    try:
+        proj_uuid = uuid.UUID(project_id)
+        cap_uuid = uuid.UUID(capability_id)
+    except (ValueError, TypeError):
+        return None
+
+    cap = _fetch_capability(conn, cap_uuid)
+    if cap is None:
+        return None
+
+    _update_experience_score(conn, proj_uuid, cap_uuid)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text, status, adopted_at, retired_at, retirement_reason "
+            "FROM component_project_use "
+            "WHERE project_id = %s AND capability_id = %s "
+            "ORDER BY adopted_at DESC",
+            (proj_uuid, cap_uuid),
+        )
+        cols = [d[0] for d in cur.description]
+        uses = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        use_ids = [u["id"] for u in uses]
+        failures = []
+        if use_ids:
+            cur.execute(
+                "SELECT fe.id::text, fe.failure_kind, fe.severity, "
+                "       fe.summary, fe.occurred_at, fe.resolved_at, fe.resolution "
+                "FROM failure_event fe "
+                "WHERE fe.component_use_id::text = ANY(%s) "
+                "ORDER BY fe.occurred_at DESC",
+                (use_ids,),
+            )
+            fcols = [d[0] for d in cur.description]
+            failures = [dict(zip(fcols, r)) for r in cur.fetchall()]
+
+        cur.execute(
+            "SELECT score, success_rate, total_uses, total_failures "
+            "FROM experience_score "
+            "WHERE project_id = %s AND capability_id = %s",
+            (proj_uuid, cap_uuid),
+        )
+        score_row = cur.fetchone()
+
+    from core.project.experience import (
+        ExperienceScoreResult,
+        summarize_usage,
+    )
+
+    exp_score = None
+    if score_row:
+        exp_score = ExperienceScoreResult(
+            score=float(score_row[0]),
+            success_rate=float(score_row[1]),
+            total_uses=score_row[2],
+            total_failures=score_row[3],
+        )
+
+    summary = summarize_usage(
+        uses=uses,
+        failures=failures,
+        score=exp_score,
+        capability_id=capability_id,
+        project_id=project_id,
+    )
+
+    return _json_safe({
+        "capability_id": capability_id,
+        "normalized_key": cap["normalized_key"],
+        "project_id": project_id,
+        "active_uses": summary.active_uses,
+        "total_failures": summary.total_failures,
+        "unresolved_failures": summary.unresolved_failures,
+        "experience_score": summary.experience_score,
+        "recommendation": summary.recommendation,
+        "uses": uses,
+        "failures": failures,
+    })
+
+
+# ---------------------------------------------------------------------------
+# failure-driven replacement — Phase 6
+# ---------------------------------------------------------------------------
+
+def find_replacement(
+    conn,
+    project_id: str,
+    capability_id: str,
+    failure_kind: str = "other",
+    severity: str = "error",
+    summary: str = "",
+    limit: int = 10,
+) -> dict[str, Any] | None:
+    """
+    Diagnose a failure and find replacement candidates for a component.
+    Combines failure diagnosis, alternative search, and ranking.
+    """
+    from core.project.replacement import (
+        diagnose_failure,
+        build_replacement_criteria,
+        rank_candidates,
+        build_replacement_plan,
+    )
+
+    try:
+        proj_uuid = uuid.UUID(project_id)
+        cap_uuid = uuid.UUID(capability_id)
+    except (ValueError, TypeError):
+        return None
+
+    cap = _fetch_capability(conn, cap_uuid)
+    if cap is None:
+        return None
+
+    cap_row = {**cap, "id": capability_id}
+
+    failure_history = []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fe.failure_kind, fe.severity, fe.summary "
+            "FROM failure_event fe "
+            "JOIN component_project_use cpu ON cpu.id = fe.component_use_id "
+            "WHERE cpu.project_id = %s AND cpu.capability_id = %s "
+            "ORDER BY fe.occurred_at DESC LIMIT 20",
+            (proj_uuid, cap_uuid),
+        )
+        for r in cur.fetchall():
+            failure_history.append({
+                "failure_kind": r[0], "severity": r[1], "summary": r[2],
+            })
+
+    diagnosis = diagnose_failure(
+        failure_kind=failure_kind,
+        severity=severity,
+        summary=summary,
+        failure_history=failure_history,
+    )
+
+    criteria = build_replacement_criteria(cap_row, diagnosis)
+
+    search_query = " ".join(criteria.search_terms) if criteria.search_terms else cap.get("display_name", "")
+
+    search_results = search_capabilities(
+        conn,
+        query=search_query,
+        ecosystem=criteria.ecosystem,
+        component_kind=criteria.component_kind,
+        project_id=project_id,
+        limit=limit + len(criteria.exclude_ids),
+    )
+
+    project_scores: dict[str, float] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT capability_id::text, score FROM experience_score "
+            "WHERE project_id = %s",
+            (proj_uuid,),
+        )
+        for r in cur.fetchall():
+            project_scores[r[0]] = float(r[1])
+
+    candidates = rank_candidates(
+        search_results, criteria.exclude_ids, project_scores,
+    )[:limit]
+
+    plan = build_replacement_plan(cap_row, diagnosis, candidates)
+
+    return _json_safe({
+        "failed_capability_id": capability_id,
+        "normalized_key": cap["normalized_key"],
+        "diagnosis": {
+            "failure_kind": diagnosis.failure_kind,
+            "category": diagnosis.category,
+            "urgency": diagnosis.urgency,
+            "root_cause_hint": diagnosis.root_cause_hint,
+            "recommended_strategy": diagnosis.recommended_strategy,
+        },
+        "recommendation": plan.recommendation,
+        "candidates": [
+            {
+                "capability_id": c.capability_id,
+                "normalized_key": c.normalized_key,
+                "display_name": c.display_name,
+                "score": c.score,
+                "reason": c.reason,
+            }
+            for c in plan.candidates
+        ],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Requirement Traceability
+# ---------------------------------------------------------------------------
+
+def import_requirements(
+    conn,
+    project_id: str,
+    yaml_text: str,
+) -> dict[str, Any] | None:
+    """
+    Parse a YAML requirement spec and upsert into project_requirement +
+    requirement_constraint. Returns summary of what was created/updated.
+    """
+    from core.project.requirements import (
+        parse_requirements_yaml,
+        RequirementParseError,
+    )
+
+    try:
+        proj_uuid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM project WHERE id = %s", (proj_uuid,))
+        if cur.fetchone() is None:
+            return None
+
+    try:
+        parsed = parse_requirements_yaml(yaml_text)
+    except RequirementParseError as e:
+        return {"error": str(e), "created": 0, "updated": 0}
+
+    created = 0
+    updated = 0
+
+    for req in parsed:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM project_requirement "
+                "WHERE project_id = %s AND slug = %s",
+                (proj_uuid, req["slug"]),
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                req_id = existing[0]
+                cur.execute(
+                    "UPDATE project_requirement SET description = %s "
+                    "WHERE id = %s",
+                    (req["description"], req_id),
+                )
+                cur.execute(
+                    "DELETE FROM requirement_constraint "
+                    "WHERE project_requirement_id = %s",
+                    (req_id,),
+                )
+                updated += 1
+            else:
+                cur.execute(
+                    "INSERT INTO project_requirement "
+                    "(project_id, slug, description) "
+                    "VALUES (%s, %s, %s) RETURNING id",
+                    (proj_uuid, req["slug"], req["description"]),
+                )
+                req_id = cur.fetchone()[0]
+                created += 1
+
+            for c in req["constraints"]:
+                cur.execute(
+                    "INSERT INTO requirement_constraint "
+                    "(project_requirement_id, kind, detail) "
+                    "VALUES (%s, %s, %s)",
+                    (req_id, c["kind"], json.dumps(c["detail"])),
+                )
+
+    conn.commit()
+
+    return _json_safe({
+        "project_id": project_id,
+        "created": created,
+        "updated": updated,
+        "total": created + updated,
+        "requirements": [r["slug"] for r in parsed],
+    })
+
+
+def requirement_coverage(
+    conn,
+    project_id: str,
+) -> dict[str, Any] | None:
+    """
+    Coverage report: for each requirement in a project, show whether it
+    has a recommendation, whether that recommendation's pick has been
+    verified, and whether there's experience data.
+    """
+    try:
+        proj_uuid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM project WHERE id = %s", (proj_uuid,))
+        if cur.fetchone() is None:
+            return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pr.id, pr.slug, pr.description "
+            "FROM project_requirement pr "
+            "WHERE pr.project_id = %s "
+            "ORDER BY pr.slug",
+            (proj_uuid,),
+        )
+        reqs = cur.fetchall()
+
+    if not reqs:
+        return _json_safe({
+            "project_id": project_id,
+            "total_requirements": 0,
+            "covered": 0,
+            "verified": 0,
+            "with_experience": 0,
+            "coverage_pct": 0.0,
+            "requirements": [],
+        })
+
+    items: list[dict[str, Any]] = []
+    covered_count = 0
+    verified_count = 0
+    experience_count = 0
+
+    for req_id, slug, description in reqs:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT r.id, r.verdict, r.chosen_capability_version_id "
+                "FROM recommendation r "
+                "WHERE r.project_requirement_id = %s "
+                "ORDER BY r.created_at DESC LIMIT 1",
+                (req_id,),
+            )
+            rec = cur.fetchone()
+
+        has_recommendation = rec is not None
+        verdict = rec[1] if rec else None
+        cv_id = rec[2] if rec else None
+
+        has_verification = False
+        verification_result = None
+        if cv_id:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT vr.result FROM verification_run vr "
+                    "WHERE vr.capability_version_id = %s "
+                    "ORDER BY vr.started_at DESC LIMIT 1",
+                    (cv_id,),
+                )
+                vr = cur.fetchone()
+                if vr:
+                    has_verification = True
+                    verification_result = vr[0]
+
+        has_experience = False
+        experience_score = None
+        if cv_id:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT cv.capability_id FROM capability_version cv "
+                    "WHERE cv.id = %s",
+                    (cv_id,),
+                )
+                cv_row = cur.fetchone()
+                if cv_row:
+                    cur.execute(
+                        "SELECT es.score FROM experience_score es "
+                        "WHERE es.project_id = %s AND es.capability_id = %s",
+                        (proj_uuid, cv_row[0]),
+                    )
+                    es = cur.fetchone()
+                    if es:
+                        has_experience = True
+                        experience_score = float(es[0])
+
+        if has_recommendation:
+            covered_count += 1
+        if has_verification:
+            verified_count += 1
+        if has_experience:
+            experience_count += 1
+
+        constraint_count = 0
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM requirement_constraint "
+                "WHERE project_requirement_id = %s",
+                (req_id,),
+            )
+            constraint_count = cur.fetchone()[0]
+
+        items.append({
+            "slug": slug,
+            "description": description,
+            "constraint_count": constraint_count,
+            "has_recommendation": has_recommendation,
+            "verdict": verdict,
+            "has_verification": has_verification,
+            "verification_result": verification_result,
+            "has_experience": has_experience,
+            "experience_score": experience_score,
+        })
+
+    total = len(reqs)
+    coverage_pct = round(covered_count / total * 100, 1) if total > 0 else 0.0
+
+    return _json_safe({
+        "project_id": project_id,
+        "total_requirements": total,
+        "covered": covered_count,
+        "verified": verified_count,
+        "with_experience": experience_count,
+        "coverage_pct": coverage_pct,
+        "requirements": items,
     })
 
 

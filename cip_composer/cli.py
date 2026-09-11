@@ -286,6 +286,122 @@ def cmd_verify_status(args) -> int:
     return 0
 
 
+def cmd_experience(args) -> int:
+    conn = connect()
+    try:
+        result = queries.experience_summary(
+            conn,
+            project_id=args.project_id,
+            capability_id=args.capability_id,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("capability or project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Capability:  {result['normalized_key']}")
+        print(f"Active uses: {result['active_uses']}")
+        print(f"Failures:    {result['total_failures']} "
+              f"({result['unresolved_failures']} unresolved)")
+        print(f"Score:       {result['experience_score']:.2f}")
+        print(f"Recommend:   {result['recommendation']}")
+    return 0
+
+
+def cmd_find_replacement(args) -> int:
+    conn = connect()
+    try:
+        result = queries.find_replacement(
+            conn,
+            project_id=args.project_id,
+            capability_id=args.capability_id,
+            failure_kind=args.failure_kind or "other",
+            severity=args.severity or "error",
+            summary=args.summary or "",
+            limit=args.limit,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("capability or project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Failed: {result['normalized_key']}")
+        d = result["diagnosis"]
+        print(f"Category: {d['category']}  Urgency: {d['urgency']}")
+        print(f"Hint: {d['root_cause_hint']}")
+        print(f"Recommendation: {result['recommendation']}")
+        if result["candidates"]:
+            print(f"\nAlternatives ({len(result['candidates'])}):")
+            for c in result["candidates"]:
+                print(f"  {c['score']:.3f}  {c['normalized_key']}  ({c['reason']})")
+        else:
+            print("\nNo alternatives found in registry.")
+    return 0
+
+
+def cmd_import_requirements(args) -> int:
+    yaml_text = Path(args.file).read_text(encoding="utf-8")
+    conn = connect()
+    try:
+        result = queries.import_requirements(
+            conn,
+            project_id=args.project_id,
+            yaml_text=yaml_text,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("project not found")
+        return 1
+    if result.get("error"):
+        print(f"parse error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Created: {result['created']}  Updated: {result['updated']}  "
+              f"Total: {result['total']}")
+        for slug in result["requirements"]:
+            print(f"  - {slug}")
+    return 0
+
+
+def cmd_requirement_coverage(args) -> int:
+    conn = connect()
+    try:
+        result = queries.requirement_coverage(
+            conn,
+            project_id=args.project_id,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Requirements: {result['total_requirements']}")
+        print(f"Covered:      {result['covered']} ({result['coverage_pct']}%)")
+        print(f"Verified:     {result['verified']}")
+        print(f"Experience:   {result['with_experience']}")
+        if result["requirements"]:
+            print()
+            for r in result["requirements"]:
+                rec = "YES" if r["has_recommendation"] else "no "
+                ver = "YES" if r["has_verification"] else "no "
+                exp = "YES" if r["has_experience"] else "no "
+                verdict = f" [{r['verdict']}]" if r["verdict"] else ""
+                print(f"  {r['slug']:30s}  rec={rec}  ver={ver}  exp={exp}{verdict}")
+    return 0
+
+
 def cmd_info(args) -> int:
     conn = connect()
     try:
@@ -409,10 +525,42 @@ def _build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--json", action="store_true")
     dc.set_defaults(func=cmd_dep_conflicts)
 
+    fr = subs.add_parser("find-replacement", help="Diagnose failure and find replacement candidates.")
+    fr.add_argument("project_id", help="UUID of the project.")
+    fr.add_argument("capability_id", help="UUID of the failed capability.")
+    fr.add_argument("--failure-kind", dest="failure_kind", default="other",
+                     help="Type of failure (install_failure, runtime_error, etc.).")
+    fr.add_argument("--severity", default="error",
+                     help="Severity: warning, error, critical.")
+    fr.add_argument("--summary", default="",
+                     help="Free-text failure description.")
+    fr.add_argument("--limit", type=int, default=10)
+    fr.add_argument("--json", action="store_true")
+    fr.set_defaults(func=cmd_find_replacement)
+
+    ex = subs.add_parser("experience", help="Experience summary for a capability in a project.")
+    ex.add_argument("project_id", help="UUID of the project.")
+    ex.add_argument("capability_id", help="UUID of the capability.")
+    ex.add_argument("--json", action="store_true")
+    ex.set_defaults(func=cmd_experience)
+
     vs = subs.add_parser("verify-status", help="Check verification status of a capability.")
     vs.add_argument("capability_id", help="UUID of the capability to check.")
     vs.add_argument("--json", action="store_true")
     vs.set_defaults(func=cmd_verify_status)
+
+    ir = subs.add_parser("import-requirements",
+                          help="Import requirements from a YAML file into a project.")
+    ir.add_argument("project_id", help="UUID of the project.")
+    ir.add_argument("file", help="Path to the YAML requirements file.")
+    ir.add_argument("--json", action="store_true")
+    ir.set_defaults(func=cmd_import_requirements)
+
+    rc = subs.add_parser("requirement-coverage",
+                          help="Show requirement coverage report for a project.")
+    rc.add_argument("project_id", help="UUID of the project.")
+    rc.add_argument("--json", action="store_true")
+    rc.set_defaults(func=cmd_requirement_coverage)
 
     i = subs.add_parser("info", help="Registry stats.")
     i.set_defaults(func=cmd_info)
