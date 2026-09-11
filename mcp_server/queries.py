@@ -27,6 +27,7 @@ from typing import Any, Optional
 from core.policy import constraints as _c
 from core.policy import compatibility as _compat
 from core.policy import dependency as _dep
+from core.policy import adapter as _adapter
 
 
 # ---------------------------------------------------------------------------
@@ -1836,6 +1837,580 @@ def requirement_coverage(
         "with_experience": experience_count,
         "coverage_pct": coverage_pct,
         "requirements": items,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — Inspection Run Tracking
+# ---------------------------------------------------------------------------
+
+def record_inspection_run(
+    conn,
+    capability_version_id: str,
+    extractor_name: str,
+    extractor_version: str = "1.0.0",
+    source_revision: str | None = None,
+    metadata: dict | None = None,
+) -> dict[str, Any] | None:
+    """
+    Start an inspection run. Returns the run record with status='running'.
+    Call finish_inspection_run when done.
+    """
+    try:
+        cv_uuid = uuid.UUID(capability_version_id)
+    except (ValueError, TypeError):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM capability_version WHERE id = %s", (cv_uuid,),
+        )
+        if cur.fetchone() is None:
+            return None
+
+        cur.execute(
+            "INSERT INTO inspection_run "
+            "(capability_version_id, extractor_name, extractor_version, "
+            " source_revision, metadata) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id, started_at",
+            (cv_uuid, extractor_name, extractor_version,
+             source_revision, json.dumps(metadata or {})),
+        )
+        row = cur.fetchone()
+        conn.commit()
+
+    return _json_safe({
+        "id": row[0],
+        "capability_version_id": capability_version_id,
+        "extractor_name": extractor_name,
+        "extractor_version": extractor_version,
+        "source_revision": source_revision,
+        "status": "running",
+        "started_at": row[1],
+    })
+
+
+def finish_inspection_run(
+    conn,
+    run_id: str,
+    status: str = "completed",
+    evidence_count: int = 0,
+    error_detail: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark an inspection run as completed or failed."""
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except (ValueError, TypeError):
+        return None
+
+    if status not in ("completed", "failed"):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE inspection_run "
+            "SET status = %s, finished_at = now(), "
+            "    evidence_count = %s, error_detail = %s "
+            "WHERE id = %s AND status = 'running' "
+            "RETURNING id, finished_at",
+            (status, evidence_count, error_detail, run_uuid),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        conn.commit()
+
+    return _json_safe({
+        "id": row[0],
+        "status": status,
+        "evidence_count": evidence_count,
+        "finished_at": row[1],
+    })
+
+
+def inspection_history(
+    conn,
+    capability_id: str,
+    extractor_name: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any] | None:
+    """
+    Return inspection run history for a capability's head version.
+    Optionally filtered by extractor_name.
+    """
+    try:
+        cap_uuid = uuid.UUID(capability_id)
+    except (ValueError, TypeError):
+        return None
+
+    cap = _fetch_capability(conn, cap_uuid)
+    if cap is None:
+        return None
+
+    head = _fetch_head_version(conn, cap_uuid)
+    if head is None:
+        return _json_safe({
+            "capability_id": capability_id,
+            "normalized_key": cap["normalized_key"],
+            "version_id": None,
+            "runs": [],
+            "extractors_covered": [],
+            "extractors_missing": [
+                "interfaces", "licenses", "manifests",
+                "secrets", "symbols", "tests",
+            ],
+        })
+
+    head_version_id = head["id"]
+
+    with conn.cursor() as cur:
+        if extractor_name:
+            cur.execute(
+                "SELECT id, extractor_name, extractor_version, "
+                "       source_revision, started_at, finished_at, "
+                "       status, evidence_count, error_detail "
+                "FROM inspection_run "
+                "WHERE capability_version_id = %s "
+                "  AND extractor_name = %s "
+                "ORDER BY started_at DESC LIMIT %s",
+                (head_version_id, extractor_name, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT id, extractor_name, extractor_version, "
+                "       source_revision, started_at, finished_at, "
+                "       status, evidence_count, error_detail "
+                "FROM inspection_run "
+                "WHERE capability_version_id = %s "
+                "ORDER BY started_at DESC LIMIT %s",
+                (head_version_id, limit),
+            )
+        rows = cur.fetchall()
+
+    runs = []
+    for r in rows:
+        runs.append({
+            "id": r[0],
+            "extractor_name": r[1],
+            "extractor_version": r[2],
+            "source_revision": r[3],
+            "started_at": r[4],
+            "finished_at": r[5],
+            "status": r[6],
+            "evidence_count": r[7],
+            "error_detail": r[8],
+        })
+
+    extractors_covered = sorted(set(r["extractor_name"] for r in runs))
+    all_extractors = ["interfaces", "licenses", "manifests", "secrets", "symbols", "tests"]
+    missing = [e for e in all_extractors if e not in extractors_covered]
+
+    return _json_safe({
+        "capability_id": capability_id,
+        "normalized_key": cap["normalized_key"],
+        "version_id": head_version_id,
+        "runs": runs,
+        "extractors_covered": extractors_covered,
+        "extractors_missing": missing,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 — Build-Gap Proof
+# ---------------------------------------------------------------------------
+
+def authorize_build(
+    conn,
+    recommendation_id: str,
+    authorized_by: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """
+    Authorize code generation for a BUILD recommendation.
+    Returns the authorization record or an error dict.
+    """
+    from core.policy.build_gate import (
+        authorize_build as _authorize,
+        BuildGateError,
+    )
+
+    try:
+        rec_uuid = uuid.UUID(recommendation_id)
+    except (ValueError, TypeError):
+        return None
+
+    if not authorized_by or not authorized_by.strip():
+        return {"error": "authorized_by must be non-empty"}
+    if not reason or not reason.strip():
+        return {"error": "reason must be non-empty"}
+
+    try:
+        auth_id = _authorize(
+            conn,
+            recommendation_id=rec_uuid,
+            authorized_by=authorized_by,
+            reason=reason,
+        )
+        conn.commit()
+    except BuildGateError as e:
+        return {"error": str(e)}
+    except ValueError as e:
+        return {"error": str(e)}
+
+    return _json_safe({
+        "build_authorization_id": auth_id,
+        "recommendation_id": recommendation_id,
+        "authorized_by": authorized_by.strip(),
+        "status": "authorized",
+    })
+
+
+def build_gate_check(
+    conn,
+    project_requirement_id: str,
+) -> dict[str, Any] | None:
+    """
+    Check whether code generation is allowed for a requirement.
+    """
+    from core.policy.build_gate import can_generate_for
+
+    try:
+        req_uuid = uuid.UUID(project_requirement_id)
+    except (ValueError, TypeError):
+        return None
+
+    decision = can_generate_for(conn, project_requirement_id=req_uuid)
+
+    return _json_safe({
+        "project_requirement_id": project_requirement_id,
+        "allowed": decision.allowed,
+        "reason": decision.reason,
+        "recommendation_id": decision.recommendation_id,
+        "build_authorization_id": decision.build_authorization_id,
+    })
+
+
+def build_coverage(
+    conn,
+    project_id: str,
+) -> dict[str, Any] | None:
+    """
+    Build authorization coverage for a project: for each requirement,
+    show recommendation verdict + whether build is authorized.
+    """
+    try:
+        proj_uuid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM project WHERE id = %s", (proj_uuid,))
+        if cur.fetchone() is None:
+            return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pr.id, pr.slug, pr.description "
+            "FROM project_requirement pr "
+            "WHERE pr.project_id = %s ORDER BY pr.slug",
+            (proj_uuid,),
+        )
+        reqs = cur.fetchall()
+
+    if not reqs:
+        return _json_safe({
+            "project_id": project_id,
+            "total_requirements": 0,
+            "build_verdicts": 0,
+            "authorized": 0,
+            "authorization_pct": 0.0,
+            "requirements": [],
+        })
+
+    items: list[dict[str, Any]] = []
+    build_count = 0
+    auth_count = 0
+
+    for req_id, slug, description in reqs:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT r.id, r.verdict, r.rule_name "
+                "FROM recommendation r "
+                "WHERE r.project_requirement_id = %s "
+                "ORDER BY r.created_at DESC LIMIT 1",
+                (req_id,),
+            )
+            rec = cur.fetchone()
+
+        has_recommendation = rec is not None
+        verdict = rec[1] if rec else None
+        rec_id = rec[0] if rec else None
+
+        is_build = verdict == "BUILD"
+        if is_build:
+            build_count += 1
+
+        has_authorization = False
+        auth_id = None
+        if rec_id:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM build_authorization "
+                    "WHERE recommendation_id = %s",
+                    (str(rec_id),),
+                )
+                auth_row = cur.fetchone()
+                if auth_row:
+                    has_authorization = True
+                    auth_id = auth_row[0]
+                    auth_count += 1
+
+        items.append({
+            "slug": slug,
+            "description": description,
+            "has_recommendation": has_recommendation,
+            "verdict": verdict,
+            "is_build": is_build,
+            "has_authorization": has_authorization,
+            "build_authorization_id": auth_id,
+        })
+
+    total = len(reqs)
+    auth_pct = round(auth_count / build_count * 100, 1) if build_count > 0 else 0.0
+
+    return _json_safe({
+        "project_id": project_id,
+        "total_requirements": total,
+        "build_verdicts": build_count,
+        "authorized": auth_count,
+        "authorization_pct": auth_pct,
+        "requirements": items,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Adapter Generation
+# ---------------------------------------------------------------------------
+
+def create_adapter_spec(
+    conn,
+    source_id: str,
+    target_id: str,
+    adapter_hint: str = "",
+    io_transform: dict | None = None,
+) -> dict[str, Any] | None:
+    """
+    Create an adapter_spec between two capabilities. Auto-classifies the
+    bridge_kind from runtimes, then generates skeleton code. Returns
+    None if either id is bad or the pair already exists.
+    """
+    try:
+        s_uuid = uuid.UUID(source_id)
+        t_uuid = uuid.UUID(target_id)
+    except (ValueError, TypeError):
+        return None
+
+    src = _fetch_row_for_compat(conn, s_uuid)
+    tgt = _fetch_row_for_compat(conn, t_uuid)
+    if src is None or tgt is None:
+        return None
+
+    src_runtime = src.get("runtime") or "unknown"
+    tgt_runtime = tgt.get("runtime") or "unknown"
+
+    bridge_kind = _adapter.classify_bridge(
+        src_runtime, tgt_runtime, adapter_hint,
+    )
+
+    skeleton = _adapter.generate_skeleton(
+        bridge_kind=bridge_kind,
+        source_name=src.get("normalized_key", "source"),
+        target_name=tgt.get("normalized_key", "target"),
+        source_runtime=src_runtime,
+        target_runtime=tgt_runtime,
+        io_transform=io_transform,
+    )
+
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "INSERT INTO adapter_spec "
+                "(source_id, target_id, bridge_kind, source_runtime, "
+                " target_runtime, adapter_hint, io_transform, "
+                " skeleton_code, test_code, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'generated') "
+                "RETURNING id, created_at",
+                (
+                    s_uuid, t_uuid, bridge_kind,
+                    src_runtime, tgt_runtime, adapter_hint,
+                    json.dumps(io_transform or {}),
+                    skeleton.adapter_code, skeleton.test_code,
+                ),
+            )
+            row = cur.fetchone()
+        except Exception:
+            conn.rollback()
+            return None
+        conn.commit()
+
+    return _json_safe({
+        "id": row[0],
+        "source_id": source_id,
+        "target_id": target_id,
+        "bridge_kind": bridge_kind,
+        "source_runtime": src_runtime,
+        "target_runtime": tgt_runtime,
+        "status": "generated",
+        "description": skeleton.description,
+        "skeleton_code": skeleton.adapter_code,
+        "test_code": skeleton.test_code,
+        "created_at": row[1],
+    })
+
+
+def get_adapter_spec(
+    conn,
+    source_id: str,
+    target_id: str,
+) -> dict[str, Any] | None:
+    """Look up an existing adapter_spec by source+target pair."""
+    try:
+        s_uuid = uuid.UUID(source_id)
+        t_uuid = uuid.UUID(target_id)
+    except (ValueError, TypeError):
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, bridge_kind, source_runtime, target_runtime, "
+            "       adapter_hint, io_transform, skeleton_code, test_code, "
+            "       status, created_at, updated_at "
+            "FROM adapter_spec "
+            "WHERE source_id = %s AND target_id = %s",
+            (s_uuid, t_uuid),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    return _json_safe({
+        "id": row[0],
+        "source_id": source_id,
+        "target_id": target_id,
+        "bridge_kind": row[1],
+        "source_runtime": row[2],
+        "target_runtime": row[3],
+        "adapter_hint": row[4],
+        "io_transform": row[5],
+        "skeleton_code": row[6],
+        "test_code": row[7],
+        "status": row[8],
+        "created_at": row[9],
+        "updated_at": row[10],
+    })
+
+
+def list_adapter_specs(
+    conn,
+    capability_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """
+    List adapter specs, optionally filtered by a capability (as source
+    or target) and/or status.
+    """
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
+
+    conditions = []
+    params: dict[str, Any] = {"limit": limit}
+
+    if capability_id:
+        try:
+            cap_uuid = uuid.UUID(capability_id)
+            conditions.append(
+                "(a.source_id = %(cap_id)s OR a.target_id = %(cap_id)s)"
+            )
+            params["cap_id"] = cap_uuid
+        except (ValueError, TypeError):
+            return []
+
+    if status:
+        conditions.append("a.status = %(status)s")
+        params["status"] = status
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    sql = f"""
+        SELECT
+            a.id, a.source_id, a.target_id, a.bridge_kind,
+            a.source_runtime, a.target_runtime, a.status,
+            a.created_at,
+            cs.normalized_key AS source_key,
+            ct.normalized_key AS target_key
+        FROM adapter_spec a
+        JOIN capability cs ON cs.id = a.source_id
+        JOIN capability ct ON ct.id = a.target_id
+        {where}
+        ORDER BY a.created_at DESC
+        LIMIT %(limit)s
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    return [
+        _json_safe({
+            "id": r[0],
+            "source_id": r[1],
+            "target_id": r[2],
+            "bridge_kind": r[3],
+            "source_runtime": r[4],
+            "target_runtime": r[5],
+            "status": r[6],
+            "created_at": r[7],
+            "source_key": r[8],
+            "target_key": r[9],
+        })
+        for r in rows
+    ]
+
+
+def update_adapter_status(
+    conn,
+    adapter_spec_id: str,
+    status: str,
+) -> dict[str, Any] | None:
+    """Advance an adapter_spec's status (draft→generated→reviewed→tested)."""
+    try:
+        spec_uuid = uuid.UUID(adapter_spec_id)
+    except (ValueError, TypeError):
+        return None
+
+    valid = ("draft", "generated", "reviewed", "tested")
+    if status not in valid:
+        return None
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE adapter_spec SET status = %s, updated_at = now() "
+            "WHERE id = %s RETURNING id, status, updated_at",
+            (status, spec_uuid),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    conn.commit()
+
+    return _json_safe({
+        "id": row[0],
+        "status": row[1],
+        "updated_at": row[2],
     })
 
 

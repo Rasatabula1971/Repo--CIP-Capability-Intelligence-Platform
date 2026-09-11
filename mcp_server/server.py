@@ -610,6 +610,220 @@ def requirement_coverage(
         conn.close()
 
 
+@mcp.tool()
+def inspection_history(
+    capability_id: str,
+    extractor_name: Optional[str] = None,
+    limit: int = 20,
+) -> Optional[dict[str, Any]]:
+    """
+    Inspection run history for a capability's head version.
+
+    Shows which extractors have run, when, with what parser version,
+    how many evidence items they produced, and whether any failed.
+    Highlights extractors that have never run (missing coverage).
+
+    Args:
+      capability_id: UUID of the capability.
+      extractor_name: optional filter — 'manifests', 'licenses',
+        'interfaces', 'symbols', 'secrets', 'tests'.
+      limit: max runs to return (default 20).
+
+    Returns {capability_id, normalized_key, version_id, runs[],
+    extractors_covered[], extractors_missing[]}. Each run has
+    {id, extractor_name, extractor_version, source_revision,
+    started_at, finished_at, status, evidence_count, error_detail}.
+    """
+    conn = connect()
+    try:
+        return queries.inspection_history(
+            conn,
+            capability_id=capability_id,
+            extractor_name=extractor_name,
+            limit=limit,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def authorize_build(
+    recommendation_id: str,
+    authorized_by: str,
+    reason: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Authorize code generation for a BUILD recommendation.
+
+    The search-before-build gate requires explicit authorization before
+    any code can be generated. Refuses if the recommendation doesn't
+    exist, isn't a BUILD verdict, or lacks search evidence.
+
+    Args:
+      recommendation_id: UUID of the BUILD recommendation.
+      authorized_by: who is authorizing (actor name).
+      reason: why build is authorized (audit trail).
+
+    Returns {build_authorization_id, recommendation_id, authorized_by,
+    status} or {error: "..."} on refusal, or None on bad id.
+    """
+    conn = connect()
+    try:
+        return queries.authorize_build(
+            conn,
+            recommendation_id=recommendation_id,
+            authorized_by=authorized_by,
+            reason=reason,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def build_gate_check(
+    project_requirement_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Check whether code generation is allowed for a requirement.
+
+    Returns whether a BUILD recommendation exists and has been
+    authorized. Code generators must call this before proceeding.
+
+    Args:
+      project_requirement_id: UUID of the project_requirement row.
+
+    Returns {project_requirement_id, allowed, reason,
+    recommendation_id, build_authorization_id} or None on bad id.
+    """
+    conn = connect()
+    try:
+        return queries.build_gate_check(
+            conn,
+            project_requirement_id=project_requirement_id,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def build_coverage(
+    project_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Build authorization coverage report for a project.
+
+    Shows each requirement's recommendation verdict and whether
+    BUILD verdicts have been authorized for code generation.
+
+    Args:
+      project_id: UUID of the project.
+
+    Returns {project_id, total_requirements, build_verdicts, authorized,
+    authorization_pct, requirements[]} where each requirement has
+    {slug, verdict, is_build, has_authorization}.
+    """
+    conn = connect()
+    try:
+        return queries.build_coverage(
+            conn,
+            project_id=project_id,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def create_adapter_spec(
+    source_id: str,
+    target_id: str,
+    adapter_hint: str = "",
+    io_transform: Optional[dict] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Create an adapter specification between two capabilities.
+
+    Auto-classifies the bridge type from runtimes and generates
+    skeleton code (adapter + contract tests) for the bridge.
+
+    Args:
+      source_id: UUID of the upstream/producing capability.
+      target_id: UUID of the downstream/consuming capability.
+      adapter_hint: optional hint string (e.g. from compatibility check).
+      io_transform: optional dict describing I/O type mapping.
+
+    Returns {id, source_id, target_id, bridge_kind, status, description,
+    skeleton_code, test_code, ...} or None if ids are bad or pair exists.
+
+    bridge_kind is one of: subprocess, http, mcp_client, type_transform,
+    pip_install, skill_invoke, generic.
+    """
+    conn = connect()
+    try:
+        return queries.create_adapter_spec(
+            conn,
+            source_id=source_id,
+            target_id=target_id,
+            adapter_hint=adapter_hint,
+            io_transform=io_transform,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_adapter_spec(
+    source_id: str,
+    target_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Look up an existing adapter specification by source+target pair.
+
+    Args:
+      source_id: UUID of the upstream capability.
+      target_id: UUID of the downstream capability.
+
+    Returns the full adapter_spec record including skeleton_code and
+    test_code, or None if not found.
+    """
+    conn = connect()
+    try:
+        return queries.get_adapter_spec(
+            conn, source_id=source_id, target_id=target_id,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def list_adapter_specs(
+    capability_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """
+    List adapter specifications, optionally filtered.
+
+    Args:
+      capability_id: optional UUID — show only specs involving this
+        capability (as source or target).
+      status: optional filter — 'draft', 'generated', 'reviewed', 'tested'.
+      limit: max rows (1-200, default 50).
+
+    Returns rows with {id, source_id, target_id, bridge_kind,
+    source_runtime, target_runtime, status, source_key, target_key}.
+    """
+    conn = connect()
+    try:
+        return queries.list_adapter_specs(
+            conn,
+            capability_id=capability_id,
+            status=status,
+            limit=limit,
+        )
+    finally:
+        conn.close()
+
+
 def main() -> None:
     """Entry point for the `cip-mcp` console script. Runs stdio transport."""
     mcp.run()

@@ -402,6 +402,164 @@ def cmd_requirement_coverage(args) -> int:
     return 0
 
 
+def cmd_inspection_history(args) -> int:
+    conn = connect()
+    try:
+        result = queries.inspection_history(
+            conn,
+            capability_id=args.capability_id,
+            extractor_name=args.extractor,
+            limit=args.limit,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("capability not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Capability: {result['normalized_key']}")
+        if result.get("extractors_covered"):
+            print(f"Covered:    {', '.join(result['extractors_covered'])}")
+        if result.get("extractors_missing"):
+            print(f"Missing:    {', '.join(result['extractors_missing'])}")
+        if result["runs"]:
+            print(f"\nRuns ({len(result['runs'])}):")
+            for r in result["runs"]:
+                status = r["status"].upper()
+                ev = f" evidence={r['evidence_count']}" if r["evidence_count"] else ""
+                err = f" error={r['error_detail']}" if r.get("error_detail") else ""
+                print(f"  [{status}] {r['extractor_name']} v{r['extractor_version']}"
+                      f" rev={r.get('source_revision', 'n/a')}{ev}{err}")
+        else:
+            print("\nNo inspection runs yet.")
+    return 0
+
+
+def cmd_authorize_build(args) -> int:
+    conn = connect()
+    try:
+        result = queries.authorize_build(
+            conn,
+            recommendation_id=args.recommendation_id,
+            authorized_by=args.authorized_by,
+            reason=args.reason,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("bad recommendation id")
+        return 1
+    if result.get("error"):
+        print(f"refused: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Authorized: {result['build_authorization_id']}")
+        print(f"  By: {result['authorized_by']}")
+        print(f"  Status: {result['status']}")
+    return 0
+
+
+def cmd_build_gate_check(args) -> int:
+    conn = connect()
+    try:
+        result = queries.build_gate_check(
+            conn,
+            project_requirement_id=args.requirement_id,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("bad requirement id")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        status = "ALLOWED" if result["allowed"] else "DENIED"
+        print(f"[{status}] {result['reason']}")
+    return 0
+
+
+def cmd_build_coverage(args) -> int:
+    conn = connect()
+    try:
+        result = queries.build_coverage(
+            conn,
+            project_id=args.project_id,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Requirements: {result['total_requirements']}")
+        print(f"BUILD verdicts: {result['build_verdicts']}")
+        print(f"Authorized:    {result['authorized']} ({result['authorization_pct']}%)")
+        if result["requirements"]:
+            print()
+            for r in result["requirements"]:
+                verdict = r.get("verdict") or "none"
+                auth = "AUTH" if r["has_authorization"] else "    "
+                print(f"  {r['slug']:30s}  verdict={verdict:10s}  {auth}")
+    return 0
+
+
+def cmd_create_adapter(args) -> int:
+    io_transform = None
+    if args.io_transform:
+        io_transform = json.loads(args.io_transform)
+    conn = connect()
+    try:
+        result = queries.create_adapter_spec(
+            conn,
+            source_id=args.source_id,
+            target_id=args.target_id,
+            adapter_hint=args.adapter_hint or "",
+            io_transform=io_transform,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("capability not found or pair already exists")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Adapter: {result['bridge_kind']}")
+        print(f"  {result['source_runtime']} -> {result['target_runtime']}")
+        print(f"  Status: {result['status']}")
+        print(f"  {result['description']}")
+        if args.show_code:
+            print(f"\n--- Skeleton Code ---\n{result['skeleton_code']}")
+            print(f"\n--- Test Code ---\n{result['test_code']}")
+    return 0
+
+
+def cmd_list_adapters(args) -> int:
+    conn = connect()
+    try:
+        rows = queries.list_adapter_specs(
+            conn,
+            capability_id=args.capability_id,
+            status=args.status,
+            limit=args.limit,
+        )
+    finally:
+        conn.close()
+    if args.json:
+        _print_json(rows)
+    else:
+        _print_row_table(rows, ["source_key", "target_key", "bridge_kind",
+                                "status", "source_runtime", "target_runtime"])
+    return 0
+
+
 def cmd_info(args) -> int:
     conn = connect()
     try:
@@ -561,6 +719,60 @@ def _build_parser() -> argparse.ArgumentParser:
     rc.add_argument("project_id", help="UUID of the project.")
     rc.add_argument("--json", action="store_true")
     rc.set_defaults(func=cmd_requirement_coverage)
+
+    ih = subs.add_parser("inspection-history",
+                          help="Show inspection run history for a capability.")
+    ih.add_argument("capability_id", help="UUID of the capability.")
+    ih.add_argument("--extractor", default=None,
+                     help="Filter by extractor (manifests, licenses, interfaces, symbols, secrets, tests).")
+    ih.add_argument("--limit", type=int, default=20)
+    ih.add_argument("--json", action="store_true")
+    ih.set_defaults(func=cmd_inspection_history)
+
+    ab = subs.add_parser("authorize-build",
+                          help="Authorize code generation for a BUILD recommendation.")
+    ab.add_argument("recommendation_id", help="UUID of the BUILD recommendation.")
+    ab.add_argument("--by", dest="authorized_by", required=True,
+                     help="Who is authorizing (actor name).")
+    ab.add_argument("--reason", required=True,
+                     help="Why build is authorized (audit trail).")
+    ab.add_argument("--json", action="store_true")
+    ab.set_defaults(func=cmd_authorize_build)
+
+    bg = subs.add_parser("build-gate-check",
+                          help="Check if code generation is allowed for a requirement.")
+    bg.add_argument("requirement_id", help="UUID of the project_requirement.")
+    bg.add_argument("--json", action="store_true")
+    bg.set_defaults(func=cmd_build_gate_check)
+
+    bc = subs.add_parser("build-coverage",
+                          help="Build authorization coverage report for a project.")
+    bc.add_argument("project_id", help="UUID of the project.")
+    bc.add_argument("--json", action="store_true")
+    bc.set_defaults(func=cmd_build_coverage)
+
+    ca = subs.add_parser("create-adapter",
+                          help="Create an adapter spec between two capabilities.")
+    ca.add_argument("source_id", help="UUID of the upstream capability.")
+    ca.add_argument("target_id", help="UUID of the downstream capability.")
+    ca.add_argument("--adapter-hint", dest="adapter_hint", default="",
+                     help="Optional bridge hint from compatibility check.")
+    ca.add_argument("--io-transform", dest="io_transform", default=None,
+                     help="JSON string describing I/O type mapping.")
+    ca.add_argument("--show-code", dest="show_code", action="store_true",
+                     help="Print the generated skeleton code.")
+    ca.add_argument("--json", action="store_true")
+    ca.set_defaults(func=cmd_create_adapter)
+
+    la = subs.add_parser("list-adapters",
+                          help="List adapter specifications.")
+    la.add_argument("--capability-id", dest="capability_id", default=None,
+                     help="Filter by capability UUID (as source or target).")
+    la.add_argument("--status", default=None,
+                     help="Filter by status (draft, generated, reviewed, tested).")
+    la.add_argument("--limit", type=int, default=50)
+    la.add_argument("--json", action="store_true")
+    la.set_defaults(func=cmd_list_adapters)
 
     i = subs.add_parser("info", help="Registry stats.")
     i.set_defaults(func=cmd_info)
