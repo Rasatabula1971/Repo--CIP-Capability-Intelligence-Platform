@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from analysis.extractors import extractor_names as _extractor_names
 from db.connection import connect
 from mcp_server import queries
 from scripts.compose.scaffold_pipeline import scaffold as _scaffold
@@ -191,6 +192,55 @@ def cmd_search_symbols(args) -> int:
     else:
         _print_row_table(rows, ["qualified_name", "symbol_kind", "role",
                                 "signature", "normalized_key"])
+    return 0
+
+
+def cmd_ingest_symbols(args) -> int:
+    conn = connect()
+    try:
+        result = queries.ingest_symbols(
+            conn,
+            capability_version_id=args.capability_version_id,
+            source_revision_id=getattr(args, "source_revision_id", None),
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("Error: invalid ID")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Inserted: {result['inserted']}, "
+              f"Skipped: {result['skipped']}, "
+              f"Total evidence: {result['total_evidence']}")
+    return 0
+
+
+def cmd_analyze_local(args) -> int:
+    from analysis.analyze_local import analyze_local
+    result = analyze_local(
+        root=args.root,
+        max_files=args.max_files,
+        include_items=args.include_items,
+    )
+    if result.errors and not result.files_scanned:
+        print(f"Error: {result.errors[0].get('error', 'unknown')}")
+        return 1
+    if args.json:
+        _print_json(result.to_dict())
+    else:
+        print(result.summary())
+    return 0
+
+
+def cmd_list_extractors(args) -> int:
+    names = _extractor_names()
+    if args.json:
+        _print_json(names)
+    else:
+        for name in names:
+            print(f"  {name}")
     return 0
 
 
@@ -667,6 +717,30 @@ def _build_parser() -> argparse.ArgumentParser:
     ss.add_argument("--limit", type=int, default=30)
     ss.add_argument("--json", action="store_true")
     ss.set_defaults(func=cmd_search_symbols)
+
+    ig = subs.add_parser("ingest-symbols",
+                          help="Materialize symbol evidence into capability_symbol rows.")
+    ig.add_argument("capability_version_id",
+                     help="UUID of the capability version to populate.")
+    ig.add_argument("--source-revision-id", dest="source_revision_id", default=None,
+                     help="Optional: scope to evidence from one source revision.")
+    ig.add_argument("--json", action="store_true")
+    ig.set_defaults(func=cmd_ingest_symbols)
+
+    al = subs.add_parser("analyze-local",
+                          help="Run all extractors against local files.")
+    al.add_argument("root", help="Directory path to scan.")
+    al.add_argument("--max-files", dest="max_files", type=int, default=5000,
+                     help="Max files to collect (default 5000).")
+    al.add_argument("--include-items", dest="include_items", action="store_true",
+                     help="Include individual evidence items in output.")
+    al.add_argument("--json", action="store_true")
+    al.set_defaults(func=cmd_analyze_local)
+
+    le = subs.add_parser("list-extractors",
+                          help="List all available evidence extractors.")
+    le.add_argument("--json", action="store_true")
+    le.set_defaults(func=cmd_list_extractors)
 
     df = subs.add_parser("dep-fit", help="Check dependency fit against an environment.")
     df.add_argument("capability_id", help="UUID of the capability to check.")

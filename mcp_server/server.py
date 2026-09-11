@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from analysis.extractors import extractor_names as _extractor_names
 from db.connection import connect
 from mcp_server import queries
 
@@ -314,11 +315,13 @@ def search_symbols(
     Args:
       query: search terms matched against symbol_name and qualified_name.
       symbol_kind: optional filter — 'function', 'async_function', 'class',
-        'method', 'async_method', 'constant', 'module'.
+        'method', 'async_method', 'constant', 'module', 'interface',
+        'type_alias', 'enum'.
       role: optional filter — 'entry_point', 'utility', 'data_model',
         'cli_command', 'api_endpoint', 'decorator', 'factory',
-        'middleware', 'exception', 'test_helper'.
-      language: optional filter — 'python' (only supported value currently).
+        'middleware', 'exception', 'test_helper', 'component', 'hook',
+        'guard', 'pipe', 'enum_type'.
+      language: optional filter — 'python', 'typescript', 'javascript'.
       capability_id: optional UUID — restrict to symbols from one capability.
       limit: max rows (1-200, default 30).
 
@@ -339,6 +342,76 @@ def search_symbols(
         )
     finally:
         conn.close()
+
+
+@mcp.tool()
+def ingest_symbols(
+    capability_version_id: str,
+    source_revision_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Materialize symbol evidence into searchable capability_symbol rows.
+
+    Reads 'symbol' evidence items produced by the Python SymbolExtractor
+    or TypeScript TSSymbolExtractor and inserts them into capability_symbol
+    for use by search_symbols. Skips duplicates by qualified_name.
+
+    Args:
+      capability_version_id: UUID of the capability version to populate.
+      source_revision_id: optional UUID — scope to evidence from one revision.
+
+    Returns {capability_version_id, inserted, skipped, total_evidence}.
+    """
+    conn = connect()
+    try:
+        return queries.ingest_symbols(
+            conn,
+            capability_version_id=capability_version_id,
+            source_revision_id=source_revision_id,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def analyze_local(
+    root: str,
+    max_files: int = 5000,
+    include_items: bool = False,
+) -> dict[str, Any]:
+    """
+    Run all extractors against local files without the DB pipeline.
+
+    Scans a directory, runs every registered extractor, and returns a
+    structured report of all evidence found. No database, no connectors,
+    no revisions needed.
+
+    Args:
+      root: directory path to scan.
+      max_files: stop collecting after this many files (default 5000).
+      include_items: if True, include individual evidence dicts in result
+        (can be large). Default False returns only aggregate counts.
+
+    Returns {root, files_scanned, files_skipped, total_evidence,
+    by_extractor, by_type, by_language, items[], errors[]}.
+    """
+    from analysis.analyze_local import analyze_local as _analyze
+    result = _analyze(root=root, max_files=max_files, include_items=include_items)
+    return result.to_dict()
+
+
+@mcp.tool()
+def list_extractors() -> list[str]:
+    """
+    List all available evidence extractors.
+
+    Returns the names of all auto-discovered extractors in the analysis
+    pipeline. Each name corresponds to an extractor that runs during
+    analysis and produces evidence items.
+
+    Returns a sorted list of extractor names.
+    """
+    return _extractor_names()
 
 
 @mcp.tool()

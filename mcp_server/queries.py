@@ -1035,6 +1035,105 @@ def search_symbols(
     return [_json_safe(row) for row in rows]
 
 
+def ingest_symbols(
+    conn,
+    capability_version_id: str,
+    source_revision_id: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Materialize symbol evidence items into capability_symbol rows.
+
+    Reads 'symbol' evidence from evidence_item (optionally scoped to a
+    source_revision_id) and inserts corresponding capability_symbol rows.
+    Skips duplicates by (capability_version_id, qualified_name).
+    Returns a summary with counts.
+    """
+    try:
+        cv_uuid = uuid.UUID(capability_version_id)
+    except (ValueError, TypeError):
+        return None
+
+    rev_filter = ""
+    params: dict[str, Any] = {"cv_id": cv_uuid}
+    if source_revision_id:
+        try:
+            rev_uuid = uuid.UUID(source_revision_id)
+            rev_filter = "AND ei.source_revision_id = %(rev_id)s"
+            params["rev_id"] = rev_uuid
+        except (ValueError, TypeError):
+            return None
+
+    sql = f"""
+        SELECT ei.id, ei.extracted_value
+        FROM evidence_item ei
+        WHERE ei.evidence_type = 'symbol'
+        {rev_filter}
+        ORDER BY ei.created_at
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        evidence_rows = cur.fetchall()
+
+    inserted = 0
+    skipped = 0
+
+    for eid, ev in evidence_rows:
+        if not isinstance(ev, dict):
+            skipped += 1
+            continue
+        qname = ev.get("qualified_name", "")
+        if not qname:
+            skipped += 1
+            continue
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM capability_symbol "
+                "WHERE capability_version_id = %s AND qualified_name = %s",
+                (cv_uuid, qname),
+            )
+            if cur.fetchone():
+                skipped += 1
+                continue
+
+            cur.execute(
+                "INSERT INTO capability_symbol "
+                "(capability_version_id, evidence_item_id, module_path, "
+                " symbol_kind, symbol_name, qualified_name, signature, "
+                " return_type, docstring_summary, role, language, metadata) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    cv_uuid,
+                    eid,
+                    ev.get("module_path", ""),
+                    ev.get("symbol_kind", "function"),
+                    ev.get("symbol_name", ""),
+                    qname,
+                    ev.get("signature"),
+                    ev.get("return_type"),
+                    ev.get("docstring_summary"),
+                    ev.get("role", "utility"),
+                    ev.get("language", "python"),
+                    json.dumps({
+                        k: v for k, v in ev.items()
+                        if k not in ("module_path", "symbol_kind", "symbol_name",
+                                     "qualified_name", "signature", "return_type",
+                                     "docstring_summary", "role", "language")
+                    }),
+                ),
+            )
+            inserted += 1
+
+    conn.commit()
+    return {
+        "capability_version_id": str(cv_uuid),
+        "inserted": inserted,
+        "skipped": skipped,
+        "total_evidence": len(evidence_rows),
+    }
+
+
 # ---------------------------------------------------------------------------
 # verify_capability — Phase 4a
 # ---------------------------------------------------------------------------
