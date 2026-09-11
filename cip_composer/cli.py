@@ -73,6 +73,7 @@ def _print_row_table(rows: list[dict], columns: list[str]) -> None:
 
 def cmd_find(args) -> int:
     conn = connect()
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else None
     try:
         rows = queries.search_capabilities(
             conn, query=args.query,
@@ -81,6 +82,7 @@ def cmd_find(args) -> int:
             runtime=args.runtime,
             cost_tier=args.cost_tier,
             project_id=args.project_id,
+            tags=tags,
             limit=args.limit,
         )
     finally:
@@ -171,6 +173,119 @@ def cmd_flow(args) -> int:
     return 0
 
 
+def cmd_search_symbols(args) -> int:
+    conn = connect()
+    try:
+        rows = queries.search_symbols(
+            conn, query=args.query,
+            symbol_kind=args.symbol_kind,
+            role=args.role,
+            language=args.language,
+            capability_id=args.capability_id,
+            limit=args.limit,
+        )
+    finally:
+        conn.close()
+    if args.json:
+        _print_json(rows)
+    else:
+        _print_row_table(rows, ["qualified_name", "symbol_kind", "role",
+                                "signature", "normalized_key"])
+    return 0
+
+
+def cmd_dep_fit(args) -> int:
+    conn = connect()
+    try:
+        result = queries.dependency_fit(
+            conn,
+            capability_id=args.capability_id,
+            project_id=args.project_id,
+            profile_name=args.profile_name or "default",
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("capability not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Capability: {result['normalized_key']}")
+        print(f"Passed: {result['passed']}")
+        if result["hard_failures"]:
+            print("\nHard Failures:")
+            for f in result["hard_failures"]:
+                print(f"  [{f['fact_kind']}] {f['fact_key']}: {f['reason']} - {f['detail']}")
+        if result["warnings"]:
+            print("\nWarnings:")
+            for w in result["warnings"]:
+                print(f"  [{w['fact_kind']}] {w['fact_key']}: {w['reason']} - {w['detail']}")
+        if result["package_deps"]:
+            print(f"\nPackage dependencies ({len(result['package_deps'])}):")
+            for d in result["package_deps"]:
+                spec = f" {d['version_spec']}" if d.get("version_spec") else ""
+                print(f"  {d['ecosystem']}:{d['name']}{spec}")
+    return 0
+
+
+def cmd_dep_conflicts(args) -> int:
+    conn = connect()
+    try:
+        result = queries.dependency_conflicts(
+            conn,
+            capability_id_a=args.capability_a,
+            capability_id_b=args.capability_b,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("one or both capabilities not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        if not result["conflicts"]:
+            print("No version conflicts detected.")
+        else:
+            print(f"{len(result['conflicts'])} conflict(s):")
+            for c in result["conflicts"]:
+                print(f"  {c['ecosystem']}:{c['name']}  {c['spec_a']}  vs  {c['spec_b']}")
+    return 0
+
+
+def cmd_verify_status(args) -> int:
+    conn = connect()
+    try:
+        result = queries.verification_status(
+            conn,
+            capability_id=args.capability_id,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("capability not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Capability: {result['normalized_key']}")
+        print(f"Version:    {result.get('display_version', 'n/a')}")
+        print(f"Verified:   {result['verified']}")
+        if result.get("runs"):
+            print(f"\nLatest runs ({len(result['runs'])}):")
+            for run in result["runs"]:
+                print(f"  [{run['result']}] duration={run.get('duration_ms', 0)}ms "
+                      f"hash={run.get('reproducibility_hash', '')}")
+                for a in run.get("assertions", []):
+                    status = "PASS" if a["passed"] else "FAIL"
+                    reason = f" — {a['reason']}" if a.get("reason") else ""
+                    print(f"    [{status}] {a['assertion_kind']}{reason}")
+        else:
+            print("\nNo verification runs yet.")
+    return 0
+
+
 def cmd_info(args) -> int:
     conn = connect()
     try:
@@ -219,6 +334,8 @@ def _add_filters(sub, include_kind: bool = True) -> None:
                       help="Filter by runtime (python_import, mcp_stdio, ...).")
     sub.add_argument("--cost-tier", dest="cost_tier", default=None,
                       help="Filter by cost_tier (free, free_tier, cheap_paid, paid).")
+    sub.add_argument("--license-status", dest="license_status", default=None,
+                      help="Filter by license_status (verified_open_source, needs_review, blocked, unknown).")
     sub.add_argument("--project-id", dest="project_id", default=None,
                       help="UUID of a project — applies its project_constraint set.")
 
@@ -230,6 +347,8 @@ def _build_parser() -> argparse.ArgumentParser:
     f = subs.add_parser("find", help="Keyword search the registry.")
     f.add_argument("query")
     _add_filters(f)
+    f.add_argument("--tags", default=None,
+                    help="Comma-separated topic tags to filter by (e.g. 'video,ai').")
     f.add_argument("--limit", type=int, default=20)
     f.add_argument("--json", action="store_true")
     f.set_defaults(func=cmd_find)
@@ -261,6 +380,39 @@ def _build_parser() -> argparse.ArgumentParser:
     fl.add_argument("--max-stages", dest="max_stages", type=int, default=5)
     fl.add_argument("--name", default=None)
     fl.set_defaults(func=cmd_flow)
+
+    ss = subs.add_parser("search-symbols", help="Search for symbols across the registry.")
+    ss.add_argument("query")
+    ss.add_argument("--symbol-kind", dest="symbol_kind", default=None,
+                     help="Filter by symbol_kind (function, class, method, ...).")
+    ss.add_argument("--role", default=None,
+                     help="Filter by role (utility, data_model, entry_point, ...).")
+    ss.add_argument("--language", default=None, help="Filter by language (python).")
+    ss.add_argument("--capability-id", dest="capability_id", default=None,
+                     help="Restrict to symbols from one capability UUID.")
+    ss.add_argument("--limit", type=int, default=30)
+    ss.add_argument("--json", action="store_true")
+    ss.set_defaults(func=cmd_search_symbols)
+
+    df = subs.add_parser("dep-fit", help="Check dependency fit against an environment.")
+    df.add_argument("capability_id", help="UUID of the capability to check.")
+    df.add_argument("--project-id", dest="project_id", default=None,
+                     help="UUID of a project whose environment_profile to check against.")
+    df.add_argument("--profile-name", dest="profile_name", default="default",
+                     help="Which environment profile to use (default: 'default').")
+    df.add_argument("--json", action="store_true")
+    df.set_defaults(func=cmd_dep_fit)
+
+    dc = subs.add_parser("dep-conflicts", help="Check version conflicts between two capabilities.")
+    dc.add_argument("capability_a", help="UUID of first capability.")
+    dc.add_argument("capability_b", help="UUID of second capability.")
+    dc.add_argument("--json", action="store_true")
+    dc.set_defaults(func=cmd_dep_conflicts)
+
+    vs = subs.add_parser("verify-status", help="Check verification status of a capability.")
+    vs.add_argument("capability_id", help="UUID of the capability to check.")
+    vs.add_argument("--json", action="store_true")
+    vs.set_defaults(func=cmd_verify_status)
 
     i = subs.add_parser("info", help="Registry stats.")
     i.set_defaults(func=cmd_info)

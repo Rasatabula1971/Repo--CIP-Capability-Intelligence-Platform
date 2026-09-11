@@ -38,13 +38,19 @@ def search_capabilities(
     runtime: Optional[str] = None,
     cost_tier: Optional[str] = None,
     project_id: Optional[str] = None,
+    tags: Optional[list[str]] = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     """
-    Keyword search the CIP capability registry.
+    Search the CIP capability registry with relevance ranking.
+
+    Uses trigram similarity for fuzzy matching (typo-tolerant), full-text
+    search on descriptions, and composite relevance scoring. Falls back
+    to substring matching when pg_trgm is not available.
 
     Args:
-      query: case-insensitive substring against display_name and normalized_key.
+      query: search terms matched against display_name, normalized_key,
+        and description fields.
       ecosystem: optional — 'pypi', 'npm', 'source'.
       capability_kind: optional semantic role — 'library', 'cli', 'service', ...
       component_kind: optional format — 'library', 'repo', 'agent', 'skill',
@@ -56,12 +62,15 @@ def search_capabilities(
         any of the project's constraints (cpu_only, must_be_free_tier,
         must_be_local, license_allowlist, etc.). Kept rows include a
         `constraint_verdicts` field showing per-constraint outcomes.
+      tags: optional list of topic strings — rows must contain ALL
+        specified tags in their metadata.topics array.
       limit: max rows (1-100, default 20).
 
     Returns rows with {id, normalized_key, display_name, ecosystem,
     capability_kind, component_kind, runtime, cost_tier, license_spdx,
-    head_version_id, display_version, total_score, confidence}. Ranked by
-    intrinsic score descending; unscored rows last.
+    head_version_id, display_version, total_score, confidence,
+    text_relevance}. Ranked by composite score: 50% text relevance,
+    35% intrinsic score, 15% recency.
     """
     conn = connect()
     try:
@@ -74,6 +83,7 @@ def search_capabilities(
             runtime=runtime,
             cost_tier=cost_tier,
             project_id=project_id,
+            tags=tags,
             limit=limit,
         )
     finally:
@@ -174,6 +184,187 @@ def capability_compatibility(
     try:
         return queries.capability_compatibility(
             conn, source_id=source_id, target_id=target_id,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def capability_license_check(
+    capability_id: str,
+    project_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Check a capability's license status.
+
+    Returns the license classification: whether it's safe to reuse,
+    needs human review, or is blocked. Optionally applies a project's
+    license policy profile.
+
+    Args:
+      capability_id: UUID of the capability row.
+      project_id: optional UUID — when set, applies the project's
+        license_policy_profile (allowed/denied SPDX lists).
+
+    Returns {capability_id, spdx_id, status, category, reason,
+    obligations} or None if the id is malformed/not found.
+
+    status is one of:
+      verified_open_source — permissive or weak-copyleft; safe to reuse
+      needs_review         — copyleft or uncommon; human decision needed
+      blocked              — no license or explicitly denied
+      unknown              — not yet evaluated
+    """
+    conn = connect()
+    try:
+        return queries.capability_license_check(
+            conn,
+            capability_id=capability_id,
+            project_id=project_id,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def dependency_fit(
+    capability_id: str,
+    project_id: Optional[str] = None,
+    profile_name: str = "default",
+) -> Optional[dict[str, Any]]:
+    """
+    Check whether a capability's dependencies are satisfiable in a
+    project's target environment.
+
+    Examines runtime version requirements, OS constraints, service
+    dependencies, system libraries, environment variables, and hardware
+    needs. Also lists the capability's package-level dependencies.
+
+    Args:
+      capability_id: UUID of the capability to check.
+      project_id: optional UUID — when set, checks against that project's
+        environment_profile.
+      profile_name: which environment profile to use (default: 'default').
+
+    Returns {capability_id, normalized_key, passed, hard_failures[],
+    warnings[], package_deps[]} or None if the id is malformed/not found.
+
+    passed is False when any hard failure exists — the capability
+    cannot run in the target environment. Warnings indicate missing
+    profile data or optional dependencies.
+    """
+    conn = connect()
+    try:
+        return queries.dependency_fit(
+            conn,
+            capability_id=capability_id,
+            project_id=project_id,
+            profile_name=profile_name,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def dependency_conflicts(
+    capability_id_a: str,
+    capability_id_b: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Detect package-level version conflicts between two capabilities.
+
+    Compares declared package dependencies and flags any where both
+    capabilities require the same package with incompatible version ranges.
+
+    Args:
+      capability_id_a: UUID of the first capability.
+      capability_id_b: UUID of the second capability.
+
+    Returns {capability_a, capability_b, conflicts[]} where each
+    conflict has {ecosystem, name, spec_a, spec_b, reason}.
+    Empty conflicts list means no detected conflicts.
+    """
+    conn = connect()
+    try:
+        return queries.dependency_conflicts(
+            conn,
+            capability_id_a=capability_id_a,
+            capability_id_b=capability_id_b,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def search_symbols(
+    query: str,
+    symbol_kind: Optional[str] = None,
+    role: Optional[str] = None,
+    language: Optional[str] = None,
+    capability_id: Optional[str] = None,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """
+    Search for symbols (functions, classes, methods) across the registry.
+
+    Finds reusable functions and classes, not just whole repositories.
+    Returns symbol-level results with module path, signature, role
+    classification, and the owning capability.
+
+    Args:
+      query: search terms matched against symbol_name and qualified_name.
+      symbol_kind: optional filter — 'function', 'async_function', 'class',
+        'method', 'async_method', 'constant', 'module'.
+      role: optional filter — 'entry_point', 'utility', 'data_model',
+        'cli_command', 'api_endpoint', 'decorator', 'factory',
+        'middleware', 'exception', 'test_helper'.
+      language: optional filter — 'python' (only supported value currently).
+      capability_id: optional UUID — restrict to symbols from one capability.
+      limit: max rows (1-200, default 30).
+
+    Returns rows with {symbol_id, module_path, symbol_kind, symbol_name,
+    qualified_name, signature, return_type, docstring_summary, role,
+    language, capability_id, normalized_key, display_name, display_version}.
+    """
+    conn = connect()
+    try:
+        return queries.search_symbols(
+            conn,
+            query=query,
+            symbol_kind=symbol_kind,
+            role=role,
+            language=language,
+            capability_id=capability_id,
+            limit=limit,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def verification_status(
+    capability_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Get the verification status of a capability's head version.
+
+    Returns the latest verification runs with their assertions
+    (install, build, import, smoke, contract checks). Shows whether
+    the capability has been verified to install and run correctly.
+
+    Args:
+      capability_id: UUID of the capability to check.
+
+    Returns {capability_id, normalized_key, version_id, display_version,
+    verified, runs[]} where each run has {id, result, duration_ms,
+    reproducibility_hash, assertions[]}. verified is True only when
+    the latest run passed all assertions.
+    """
+    conn = connect()
+    try:
+        return queries.verification_status(
+            conn,
+            capability_id=capability_id,
         )
     finally:
         conn.close()

@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from core.policy import constraints as _c
 from core.policy import compatibility as _compat
+from core.policy import dependency as _dep
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +41,20 @@ def search_capabilities(
     runtime: str | None = None,
     cost_tier: str | None = None,
     project_id: str | None = None,
+    tags: list[str] | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
     """
-    Case-insensitive substring search over display_name and normalized_key,
-    joined to the head (non-superseded) version and its scorecard when one
-    exists. Returns the top `limit` rows ordered by intrinsic score desc,
-    display_name asc.
+    Search the CIP capability registry with relevance ranking.
+
+    Uses trigram similarity on display_name and normalized_key for fuzzy
+    matching (typo-tolerant), plus full-text search on description fields
+    in metadata. Results are ranked by a composite score:
+
+        rank = (0.5 * text_relevance) + (0.35 * intrinsic_score) + (0.15 * recency)
+
+    Falls back to ILIKE substring matching when pg_trgm is not available
+    (e.g. in test databases without the extension).
 
     Filters (all optional, ANDed together):
       ecosystem       — 'pypi', 'npm', 'source', ...
@@ -55,6 +63,7 @@ def search_capabilities(
                         'mcp_tool', 'workflow_template')
       runtime         — 'python_import', 'mcp_stdio', 'claude_skill', ...
       cost_tier       — 'free', 'free_tier', 'cheap_paid', 'paid'
+      tags            — list of topic strings; rows must contain ALL tags
     """
     q = (query or "").strip()
     if not q:
@@ -64,52 +73,16 @@ def search_capabilities(
     if limit > 100:
         limit = 100
 
-    sql = """
-        SELECT
-            c.id::text          AS id,
-            c.normalized_key,
-            c.display_name,
-            c.ecosystem,
-            c.kind              AS capability_kind,
-            c.component_kind,
-            c.runtime,
-            c.cost_tier,
-            c.license_spdx,
-            v.id::text          AS head_version_id,
-            v.display_version,
-            s.total_score,
-            s.confidence
-        FROM capability c
-        LEFT JOIN LATERAL (
-            SELECT id, display_version
-            FROM capability_version
-            WHERE capability_id = c.id
-              AND superseded_by_id IS NULL
-            ORDER BY created_at DESC
-            LIMIT 1
-        ) v ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT total_score, confidence
-            FROM scorecard
-            WHERE capability_version_id = v.id
-            ORDER BY computed_at DESC
-            LIMIT 1
-        ) s ON TRUE
-        WHERE (
-                c.display_name ILIKE %(pat)s
-             OR c.normalized_key ILIKE %(pat)s
-        )
-          AND (%(ecosystem)s::text       IS NULL OR c.ecosystem       = %(ecosystem)s)
-          AND (%(capability_kind)s::text IS NULL OR c.kind            = %(capability_kind)s)
-          AND (%(component_kind)s::text  IS NULL OR c.component_kind  = %(component_kind)s)
-          AND (%(runtime)s::text         IS NULL OR c.runtime         = %(runtime)s)
-          AND (%(cost_tier)s::text       IS NULL OR c.cost_tier       = %(cost_tier)s)
-        ORDER BY
-            COALESCE(s.total_score, 0) DESC,
-            c.display_name ASC
-        LIMIT %(limit)s
-    """
-    params = {
+    has_trgm = _has_pg_trgm(conn)
+
+    if has_trgm:
+        sql = _SEARCH_SQL_TRGM
+    else:
+        sql = _SEARCH_SQL_ILIKE
+
+    params: dict[str, Any] = {
+        "query": q,
+        "query_lower": q.lower(),
         "pat": f"%{q}%",
         "ecosystem": ecosystem,
         "capability_kind": capability_kind,
@@ -118,12 +91,191 @@ def search_capabilities(
         "cost_tier": cost_tier,
         "limit": limit,
     }
+
+    tag_clause = ""
+    if tags:
+        tag_clauses = []
+        for i, tag in enumerate(tags):
+            key = f"tag_{i}"
+            tag_clauses.append(
+                f"c.metadata -> 'topics' @> to_jsonb(%({key})s::text)"
+            )
+            params[key] = tag
+        tag_clause = " AND " + " AND ".join(tag_clauses)
+
+    sql = sql.replace("/* TAG_FILTER */", tag_clause)
+
     with conn.cursor() as cur:
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     rows = _filter_by_constraints(conn, rows, project_id)
     return [_json_safe(row) for row in rows]
+
+
+def _has_pg_trgm(conn) -> bool:
+    """Check whether the pg_trgm extension is installed."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'"
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+_SEARCH_SQL_TRGM = """
+    SELECT
+        c.id::text          AS id,
+        c.normalized_key,
+        c.display_name,
+        c.ecosystem,
+        c.kind              AS capability_kind,
+        c.component_kind,
+        c.runtime,
+        c.cost_tier,
+        c.license_spdx,
+        c.license_status,
+        v.id::text          AS head_version_id,
+        v.display_version,
+        s.total_score,
+        s.confidence,
+        GREATEST(
+            similarity(lower(c.display_name), %(query_lower)s),
+            similarity(lower(c.normalized_key), %(query_lower)s),
+            CASE WHEN lower(c.display_name) LIKE '%%' || %(query_lower)s || '%%'
+                 THEN 0.3 ELSE 0 END,
+            CASE WHEN lower(c.normalized_key) LIKE '%%' || %(query_lower)s || '%%'
+                 THEN 0.3 ELSE 0 END,
+            CASE WHEN to_tsvector('english',
+                    COALESCE(c.metadata->>'description', '') || ' ' ||
+                    COALESCE(c.metadata->>'gemini_description', '')
+                 ) @@ plainto_tsquery('english', %(query)s)
+                 THEN 0.25 ELSE 0 END
+        )                   AS text_relevance
+    FROM capability c
+    LEFT JOIN LATERAL (
+        SELECT id, display_version
+        FROM capability_version
+        WHERE capability_id = c.id
+          AND superseded_by_id IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+    ) v ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT total_score, confidence
+        FROM scorecard
+        WHERE capability_version_id = v.id
+        ORDER BY computed_at DESC
+        LIMIT 1
+    ) s ON TRUE
+    WHERE (
+            lower(c.display_name) %% %(query_lower)s
+         OR lower(c.normalized_key) %% %(query_lower)s
+         OR c.display_name ILIKE %(pat)s
+         OR c.normalized_key ILIKE %(pat)s
+         OR to_tsvector('english',
+                COALESCE(c.metadata->>'description', '') || ' ' ||
+                COALESCE(c.metadata->>'gemini_description', '')
+            ) @@ plainto_tsquery('english', %(query)s)
+    )
+      AND (%(ecosystem)s::text       IS NULL OR c.ecosystem       = %(ecosystem)s)
+      AND (%(capability_kind)s::text IS NULL OR c.kind            = %(capability_kind)s)
+      AND (%(component_kind)s::text  IS NULL OR c.component_kind  = %(component_kind)s)
+      AND (%(runtime)s::text         IS NULL OR c.runtime         = %(runtime)s)
+      AND (%(cost_tier)s::text       IS NULL OR c.cost_tier       = %(cost_tier)s)
+      /* TAG_FILTER */
+    ORDER BY
+        (0.50 * GREATEST(
+            similarity(lower(c.display_name), %(query_lower)s),
+            similarity(lower(c.normalized_key), %(query_lower)s),
+            CASE WHEN lower(c.display_name) LIKE '%%' || %(query_lower)s || '%%'
+                 THEN 0.3 ELSE 0 END,
+            CASE WHEN lower(c.normalized_key) LIKE '%%' || %(query_lower)s || '%%'
+                 THEN 0.3 ELSE 0 END,
+            CASE WHEN to_tsvector('english',
+                    COALESCE(c.metadata->>'description', '') || ' ' ||
+                    COALESCE(c.metadata->>'gemini_description', '')
+                 ) @@ plainto_tsquery('english', %(query)s)
+                 THEN 0.25 ELSE 0 END
+         )
+         + 0.35 * COALESCE(s.total_score, 0)
+         + 0.15 * LEAST(1.0,
+             EXTRACT(EPOCH FROM (now() - c.first_seen_at)) /
+             EXTRACT(EPOCH FROM INTERVAL '365 days')
+           )
+        ) DESC,
+        c.display_name ASC
+    LIMIT %(limit)s
+"""
+
+_SEARCH_SQL_ILIKE = """
+    SELECT
+        c.id::text          AS id,
+        c.normalized_key,
+        c.display_name,
+        c.ecosystem,
+        c.kind              AS capability_kind,
+        c.component_kind,
+        c.runtime,
+        c.cost_tier,
+        c.license_spdx,
+        c.license_status,
+        v.id::text          AS head_version_id,
+        v.display_version,
+        s.total_score,
+        s.confidence,
+        CASE WHEN lower(c.display_name) = %(query_lower)s THEN 1.0
+             WHEN lower(c.display_name) LIKE %(query_lower)s || '%%' THEN 0.8
+             WHEN lower(c.normalized_key) LIKE %(query_lower)s || '%%' THEN 0.7
+             WHEN c.display_name ILIKE %(pat)s THEN 0.5
+             WHEN c.normalized_key ILIKE %(pat)s THEN 0.4
+             ELSE 0.3
+        END                 AS text_relevance
+    FROM capability c
+    LEFT JOIN LATERAL (
+        SELECT id, display_version
+        FROM capability_version
+        WHERE capability_id = c.id
+          AND superseded_by_id IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+    ) v ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT total_score, confidence
+        FROM scorecard
+        WHERE capability_version_id = v.id
+        ORDER BY computed_at DESC
+        LIMIT 1
+    ) s ON TRUE
+    WHERE (
+            c.display_name ILIKE %(pat)s
+         OR c.normalized_key ILIKE %(pat)s
+    )
+      AND (%(ecosystem)s::text       IS NULL OR c.ecosystem       = %(ecosystem)s)
+      AND (%(capability_kind)s::text IS NULL OR c.kind            = %(capability_kind)s)
+      AND (%(component_kind)s::text  IS NULL OR c.component_kind  = %(component_kind)s)
+      AND (%(runtime)s::text         IS NULL OR c.runtime         = %(runtime)s)
+      AND (%(cost_tier)s::text       IS NULL OR c.cost_tier       = %(cost_tier)s)
+      /* TAG_FILTER */
+    ORDER BY
+        (0.50 * CASE WHEN lower(c.display_name) = %(query_lower)s THEN 1.0
+                     WHEN lower(c.display_name) LIKE %(query_lower)s || '%%' THEN 0.8
+                     WHEN lower(c.normalized_key) LIKE %(query_lower)s || '%%' THEN 0.7
+                     WHEN c.display_name ILIKE %(pat)s THEN 0.5
+                     WHEN c.normalized_key ILIKE %(pat)s THEN 0.4
+                     ELSE 0.3
+                END
+         + 0.35 * COALESCE(s.total_score, 0)
+         + 0.15 * LEAST(1.0,
+             EXTRACT(EPOCH FROM (now() - c.first_seen_at)) /
+             EXTRACT(EPOCH FROM INTERVAL '365 days')
+           )
+        ) DESC,
+        c.display_name ASC
+    LIMIT %(limit)s
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +316,7 @@ def browse_components(
             c.runtime,
             c.cost_tier,
             c.license_spdx,
+            c.license_status,
             v.id::text          AS head_version_id,
             v.display_version,
             s.total_score,
@@ -266,7 +419,7 @@ def _fetch_capability(conn, cap_id: uuid.UUID) -> dict[str, Any] | None:
         cur.execute(
             "SELECT normalized_key, display_name, ecosystem, kind, "
             "       component_kind, runtime, cost_tier, license_spdx, "
-            "       first_seen_at "
+            "       license_status, first_seen_at "
             "FROM capability WHERE id = %s",
             (cap_id,),
         )
@@ -282,7 +435,8 @@ def _fetch_capability(conn, cap_id: uuid.UUID) -> dict[str, Any] | None:
         "runtime": row[5],
         "cost_tier": row[6],
         "license_spdx": row[7],
-        "first_seen_at": row[8],
+        "license_status": row[8],
+        "first_seen_at": row[9],
     }
 
 
@@ -584,6 +738,452 @@ def capability_compatibility(
         "detail": v.detail,
         "io_type_check": v.io_type_check,
         "adapter_hint": v.adapter_hint,
+    })
+
+
+# ---------------------------------------------------------------------------
+# capability_license_check
+# ---------------------------------------------------------------------------
+
+def capability_license_check(
+    conn,
+    capability_id: str,
+    project_id: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Run the license classifier on a capability and return the result.
+    Optionally applies a project's license_policy_profile.
+    """
+    try:
+        cap_uuid = uuid.UUID(capability_id)
+    except (ValueError, TypeError):
+        return None
+
+    from core.policy.license import check_license
+
+    result = check_license(
+        conn,
+        capability_id=cap_uuid,
+        project_id=uuid.UUID(project_id) if project_id else None,
+    )
+
+    return _json_safe({
+        "capability_id": capability_id,
+        "spdx_id": result.spdx_id,
+        "status": result.status.value,
+        "category": result.category.value,
+        "reason": result.reason,
+        "obligations": result.obligations,
+    })
+
+
+# ---------------------------------------------------------------------------
+# dependency_fit — Phase 2
+# ---------------------------------------------------------------------------
+
+def _load_dependency_facts(
+    conn, capability_version_id: uuid.UUID,
+) -> list[_dep.DependencyFact]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fact_kind, fact_key, version_spec, required, metadata "
+            "FROM dependency_fact "
+            "WHERE capability_version_id = %s "
+            "ORDER BY fact_kind, fact_key",
+            (capability_version_id,),
+        )
+        return [
+            _dep.DependencyFact(
+                fact_kind=r[0],
+                fact_key=r[1],
+                version_spec=r[2],
+                required=r[3],
+                metadata=r[4] or {},
+            )
+            for r in cur.fetchall()
+        ]
+
+
+def _load_environment_profile(
+    conn, project_id: uuid.UUID, profile_name: str = "default",
+) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT profile FROM environment_profile "
+            "WHERE project_id = %s AND name = %s",
+            (project_id, profile_name),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return {}
+    return row[0] or {}
+
+
+def _load_package_deps(
+    conn, capability_version_id: uuid.UUID,
+) -> list[dict[str, str]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT depends_on_ecosystem, depends_on_name, version_spec "
+            "FROM capability_dependency "
+            "WHERE capability_version_id = %s",
+            (capability_version_id,),
+        )
+        return [
+            {"ecosystem": r[0], "name": r[1], "version_spec": r[2]}
+            for r in cur.fetchall()
+        ]
+
+
+def dependency_fit(
+    conn,
+    capability_id: str,
+    project_id: str | None = None,
+    profile_name: str = "default",
+) -> dict[str, Any] | None:
+    """
+    Check whether a capability's dependencies are satisfiable in a
+    project's environment profile.
+
+    Checks both dependency_fact rows (runtime, OS, services, etc.) and
+    capability_dependency rows (package-level deps). Returns the fit
+    result with hard failures and warnings.
+    """
+    try:
+        cap_uuid = uuid.UUID(capability_id)
+    except (ValueError, TypeError):
+        return None
+
+    cap = _fetch_capability(conn, cap_uuid)
+    if cap is None:
+        return None
+
+    head = _fetch_head_version(conn, cap_uuid)
+    if head is None:
+        return _json_safe({
+            "capability_id": capability_id,
+            "normalized_key": cap["normalized_key"],
+            "passed": True,
+            "hard_failures": [],
+            "warnings": [{"fact_kind": "info", "fact_key": "no_version",
+                          "severity": "warning",
+                          "reason": "no head version — nothing to check"}],
+            "package_deps": [],
+        })
+
+    version_id = head["id"]
+
+    facts = _load_dependency_facts(conn, version_id)
+    profile: dict[str, Any] = {}
+    if project_id:
+        try:
+            pid = uuid.UUID(project_id)
+            profile = _load_environment_profile(conn, pid, profile_name)
+        except (ValueError, TypeError):
+            pass
+
+    result = _dep.evaluate_dependency_fit(facts, profile)
+    pkg_deps = _load_package_deps(conn, version_id)
+
+    return _json_safe({
+        "capability_id": capability_id,
+        "normalized_key": cap["normalized_key"],
+        "passed": result.passed,
+        "hard_failures": [
+            {"fact_kind": f.fact_kind, "fact_key": f.fact_key,
+             "severity": f.severity.value, "reason": f.reason,
+             "detail": f.detail}
+            for f in result.hard_failures
+        ],
+        "warnings": [
+            {"fact_kind": f.fact_kind, "fact_key": f.fact_key,
+             "severity": f.severity.value, "reason": f.reason,
+             "detail": f.detail}
+            for f in result.warnings
+        ],
+        "package_deps": pkg_deps,
+    })
+
+
+def dependency_conflicts(
+    conn,
+    capability_id_a: str,
+    capability_id_b: str,
+) -> dict[str, Any] | None:
+    """
+    Check for package-level version conflicts between two capabilities.
+    """
+    try:
+        a_uuid = uuid.UUID(capability_id_a)
+        b_uuid = uuid.UUID(capability_id_b)
+    except (ValueError, TypeError):
+        return None
+
+    cap_a = _fetch_capability(conn, a_uuid)
+    cap_b = _fetch_capability(conn, b_uuid)
+    if cap_a is None or cap_b is None:
+        return None
+
+    head_a = _fetch_head_version(conn, a_uuid)
+    head_b = _fetch_head_version(conn, b_uuid)
+    if head_a is None or head_b is None:
+        return _json_safe({
+            "capability_a": capability_id_a,
+            "capability_b": capability_id_b,
+            "conflicts": [],
+            "note": "one or both capabilities have no head version",
+        })
+
+    deps_a = _load_package_deps(conn, head_a["id"])
+    deps_b = _load_package_deps(conn, head_b["id"])
+
+    conflicts = _dep.detect_version_conflicts(deps_a, deps_b)
+
+    return _json_safe({
+        "capability_a": capability_id_a,
+        "capability_b": capability_id_b,
+        "conflicts": conflicts,
+    })
+
+
+# ---------------------------------------------------------------------------
+# search_symbols — Phase 3
+# ---------------------------------------------------------------------------
+
+def search_symbols(
+    conn,
+    query: str,
+    symbol_kind: str | None = None,
+    role: str | None = None,
+    language: str | None = None,
+    capability_id: str | None = None,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """
+    Search capability_symbol by name or qualified_name. Uses ILIKE for
+    substring matching (trigram indexes may not exist on capability_symbol).
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
+
+    cap_filter = ""
+    params: dict[str, Any] = {
+        "pat": f"%{q}%",
+        "query_lower": q.lower(),
+        "symbol_kind": symbol_kind,
+        "role": role,
+        "language": language,
+        "limit": limit,
+    }
+    if capability_id:
+        try:
+            cap_uuid = uuid.UUID(capability_id)
+            cap_filter = "AND cv.capability_id = %(cap_id)s"
+            params["cap_id"] = cap_uuid
+        except (ValueError, TypeError):
+            pass
+
+    sql = f"""
+        SELECT
+            s.id::text          AS symbol_id,
+            s.module_path,
+            s.symbol_kind,
+            s.symbol_name,
+            s.qualified_name,
+            s.signature,
+            s.return_type,
+            s.docstring_summary,
+            s.role,
+            s.language,
+            c.id::text          AS capability_id,
+            c.normalized_key,
+            c.display_name,
+            cv.display_version
+        FROM capability_symbol s
+        JOIN capability_version cv ON cv.id = s.capability_version_id
+        JOIN capability c ON c.id = cv.capability_id
+        WHERE (
+            s.symbol_name ILIKE %(pat)s
+            OR s.qualified_name ILIKE %(pat)s
+        )
+        AND cv.superseded_by_id IS NULL
+        AND (%(symbol_kind)s::text IS NULL OR s.symbol_kind = %(symbol_kind)s)
+        AND (%(role)s::text       IS NULL OR s.role         = %(role)s)
+        AND (%(language)s::text   IS NULL OR s.language     = %(language)s)
+        {cap_filter}
+        ORDER BY
+            CASE WHEN lower(s.symbol_name) = %(query_lower)s THEN 0
+                 WHEN lower(s.symbol_name) LIKE %(query_lower)s || '%%' THEN 1
+                 WHEN lower(s.qualified_name) LIKE '%%.' || %(query_lower)s THEN 2
+                 ELSE 3
+            END,
+            s.symbol_name ASC
+        LIMIT %(limit)s
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return [_json_safe(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# verify_capability — Phase 4a
+# ---------------------------------------------------------------------------
+
+def record_verification_run(
+    conn,
+    capability_version_id: str,
+    result: str,
+    environment: dict[str, Any] | None = None,
+    duration_ms: int = 0,
+    logs: str = "",
+    artifacts: list[dict] | None = None,
+    reproducibility_hash: str = "",
+    triggered_by: str = "manual",
+    assertions: list[dict] | None = None,
+) -> dict[str, Any] | None:
+    """
+    Record a completed verification run and its assertions.
+    Returns the run record with assertion summaries.
+    """
+    try:
+        ver_uuid = uuid.UUID(capability_version_id)
+    except (ValueError, TypeError):
+        return None
+
+    import json as _json
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO verification_run "
+            "(capability_version_id, result, environment, duration_ms, "
+            " logs, artifacts, reproducibility_hash, triggered_by, "
+            " finished_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now()) RETURNING id",
+            (
+                ver_uuid,
+                result,
+                _json.dumps(environment or {}),
+                duration_ms,
+                logs,
+                _json.dumps(artifacts or []),
+                reproducibility_hash,
+                triggered_by,
+            ),
+        )
+        run_id = cur.fetchone()[0]
+
+        assertion_rows = []
+        for a in (assertions or []):
+            cur.execute(
+                "INSERT INTO verification_assertion "
+                "(verification_run_id, assertion_kind, command, exit_code, "
+                " stdout, stderr, duration_ms, passed, reason) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (
+                    run_id,
+                    a.get("assertion_kind", ""),
+                    a.get("command", ""),
+                    a.get("exit_code"),
+                    a.get("stdout", ""),
+                    a.get("stderr", ""),
+                    a.get("duration_ms", 0),
+                    a.get("passed", False),
+                    a.get("reason", ""),
+                ),
+            )
+            assertion_rows.append({
+                "id": str(cur.fetchone()[0]),
+                "assertion_kind": a.get("assertion_kind"),
+                "passed": a.get("passed", False),
+                "reason": a.get("reason", ""),
+            })
+
+    conn.commit()
+
+    return _json_safe({
+        "run_id": str(run_id),
+        "capability_version_id": capability_version_id,
+        "result": result,
+        "duration_ms": duration_ms,
+        "reproducibility_hash": reproducibility_hash,
+        "assertions": assertion_rows,
+    })
+
+
+def verification_status(
+    conn,
+    capability_id: str,
+) -> dict[str, Any] | None:
+    """
+    Get verification status for a capability's head version.
+    Returns the latest run with its assertions.
+    """
+    try:
+        cap_uuid = uuid.UUID(capability_id)
+    except (ValueError, TypeError):
+        return None
+
+    cap = _fetch_capability(conn, cap_uuid)
+    if cap is None:
+        return None
+
+    head = _fetch_head_version(conn, cap_uuid)
+    if head is None:
+        return _json_safe({
+            "capability_id": capability_id,
+            "normalized_key": cap["normalized_key"],
+            "verified": False,
+            "runs": [],
+            "note": "no head version",
+        })
+
+    version_id = head["id"]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, result, duration_ms, reproducibility_hash, "
+            "       triggered_by, started_at, finished_at "
+            "FROM verification_run "
+            "WHERE capability_version_id = %s "
+            "ORDER BY started_at DESC LIMIT 5",
+            (version_id,),
+        )
+        cols = [d[0] for d in cur.description]
+        runs = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    for run in runs:
+        run["id"] = str(run["id"])
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT assertion_kind, passed, reason, duration_ms "
+                "FROM verification_assertion "
+                "WHERE verification_run_id = %s "
+                "ORDER BY created_at",
+                (run["id"],),
+            )
+            run["assertions"] = [
+                {"assertion_kind": r[0], "passed": r[1],
+                 "reason": r[2], "duration_ms": r[3]}
+                for r in cur.fetchall()
+            ]
+
+    latest_passed = runs[0]["result"] == "passed" if runs else False
+
+    return _json_safe({
+        "capability_id": capability_id,
+        "normalized_key": cap["normalized_key"],
+        "version_id": str(version_id),
+        "display_version": head.get("display_version", ""),
+        "verified": latest_passed,
+        "runs": runs,
     })
 
 

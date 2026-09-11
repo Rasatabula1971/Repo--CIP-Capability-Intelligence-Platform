@@ -13,6 +13,8 @@ from db.connection import connect
 from db import migrate
 
 TABLES_IN_TRUNCATE_ORDER = [
+    "verification_assertion",
+    "verification_run",
     "workflow_template_step",
     "component_score",
     "capability_link",
