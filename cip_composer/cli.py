@@ -37,6 +37,7 @@ from typing import Any
 from analysis.extractors import extractor_names as _extractor_names
 from db.connection import connect
 from mcp_server import queries
+from mcp_server import pdr_queries
 from scripts.compose.scaffold_pipeline import scaffold as _scaffold
 from scripts.compose.suggest_pipeline import (
     suggest_pipeline as _suggest,
@@ -610,6 +611,121 @@ def cmd_list_adapters(args) -> int:
     return 0
 
 
+def cmd_ingest_pdr(args) -> int:
+    pdr_text = Path(args.file).read_text(encoding="utf-8")
+    conn = connect()
+    try:
+        result = pdr_queries.ingest_pdr(
+            conn, project_name=args.project_name,
+            pdr_title=args.title or Path(args.file).stem,
+            pdr_text=pdr_text,
+            project_id=getattr(args, "project_id", None),
+        )
+    finally:
+        conn.close()
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        dup = " (duplicate)" if result.get("was_duplicate") else ""
+        print(f"Project:  {result['project_id']}")
+        print(f"Source:   {result['requirement_source_id']}{dup}")
+        print(f"Hash:     {result['content_hash'][:16]}...")
+    return 0
+
+
+def cmd_record_requirements(args) -> int:
+    reqs_text = Path(args.file).read_text(encoding="utf-8")
+    reqs = json.loads(reqs_text)
+    if isinstance(reqs, dict):
+        reqs = reqs.get("requirements", [reqs])
+    conn = connect()
+    try:
+        result = pdr_queries.record_requirements(
+            conn, project_id=args.project_id,
+            requirement_source_id=args.source_id,
+            requirements=reqs,
+        )
+    finally:
+        conn.close()
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        for r in result["requirements"]:
+            status = "OK" if r["valid"] else "INVALID"
+            slug = r.get("slug", "?")
+            errs = "; ".join(r.get("errors", []))
+            extra = f" — {errs}" if errs else ""
+            print(f"  [{status}] {slug}{extra}")
+    return 0
+
+
+def cmd_pdr_lock(args) -> int:
+    conn = connect()
+    try:
+        result = pdr_queries.lock_architecture(
+            conn, project_id=args.project_id,
+            approved_by=args.by, approval_note=args.note,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("Project not found")
+        return 1
+    if result.get("refused"):
+        print(f"Refused: {result['reason']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Lock v{result['version']}: {result['architecture_lock_id']}")
+        print(f"  Decisions: {result['decision_count']}")
+        print(f"  Hash: {result['source_lock_hash'][:16]}...")
+    return 0
+
+
+def cmd_pdr_coverage(args) -> int:
+    conn = connect()
+    try:
+        result = pdr_queries.coverage(conn, project_id=args.project_id)
+    finally:
+        conn.close()
+    if result is None:
+        print("Project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Project: {result['project_name']}")
+        print(f"  Requirements: {result['total_requirements']}")
+        print(f"  Decided:      {result['decided']}")
+        print(f"  Tasked:       {result['tasked']}")
+        print(f"  Implemented:  {result['implemented']}")
+        print(f"  Verified:     {result['verified']}")
+    return 0
+
+
+def cmd_pdr_brief(args) -> int:
+    conn = connect()
+    try:
+        result = pdr_queries.build_approval_brief(conn, project_id=args.project_id)
+    finally:
+        conn.close()
+    if result is None:
+        print("Project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(result["brief_markdown"])
+    return 0
+
+
 def cmd_info(args) -> int:
     conn = connect()
     try:
@@ -847,6 +963,41 @@ def _build_parser() -> argparse.ArgumentParser:
     la.add_argument("--limit", type=int, default=50)
     la.add_argument("--json", action="store_true")
     la.set_defaults(func=cmd_list_adapters)
+
+    ip = subs.add_parser("ingest-pdr", help="Ingest a PDR document into a project.")
+    ip.add_argument("file", help="Path to the PDR text file.")
+    ip.add_argument("--project-name", dest="project_name", required=True,
+                     help="Project name (created if new).")
+    ip.add_argument("--title", default=None, help="PDR title (defaults to filename).")
+    ip.add_argument("--project-id", dest="project_id", default=None,
+                     help="Existing project UUID.")
+    ip.add_argument("--json", action="store_true")
+    ip.set_defaults(func=cmd_ingest_pdr)
+
+    rr = subs.add_parser("record-requirements",
+                          help="Record extracted requirements from a PDR.")
+    rr.add_argument("project_id", help="UUID of the project.")
+    rr.add_argument("source_id", help="UUID of the requirement_source.")
+    rr.add_argument("file", help="JSON file with requirements array.")
+    rr.add_argument("--json", action="store_true")
+    rr.set_defaults(func=cmd_record_requirements)
+
+    pl = subs.add_parser("pdr-lock", help="Lock the architecture for a project.")
+    pl.add_argument("project_id", help="UUID of the project.")
+    pl.add_argument("--by", dest="by", required=True, help="Who is approving.")
+    pl.add_argument("--note", default=None, help="Approval note.")
+    pl.add_argument("--json", action="store_true")
+    pl.set_defaults(func=cmd_pdr_lock)
+
+    pc = subs.add_parser("pdr-coverage", help="PDR implementation coverage report.")
+    pc.add_argument("project_id", help="UUID of the project.")
+    pc.add_argument("--json", action="store_true")
+    pc.set_defaults(func=cmd_pdr_coverage)
+
+    pb = subs.add_parser("pdr-brief", help="Render the approval brief for a project.")
+    pb.add_argument("project_id", help="UUID of the project.")
+    pb.add_argument("--json", action="store_true")
+    pb.set_defaults(func=cmd_pdr_brief)
 
     i = subs.add_parser("info", help="Registry stats.")
     i.set_defaults(func=cmd_info)

@@ -25,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 from analysis.extractors import extractor_names as _extractor_names
 from db.connection import connect
 from mcp_server import queries
+from mcp_server import pdr_queries
 
 
 mcp = FastMCP("cip")
@@ -893,6 +894,303 @@ def list_adapter_specs(
             status=status,
             limit=limit,
         )
+    finally:
+        conn.close()
+
+
+# -----------------------------------------------------------------------
+# PDR-to-Build workflow tools (vNext)
+# -----------------------------------------------------------------------
+
+@mcp.tool()
+def ingest_pdr(
+    project_name: str,
+    pdr_title: str,
+    pdr_text: str,
+    project_id: Optional[str] = None,
+    stack: Optional[str] = None,
+    policy_profile: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Register a project and store the PDR as the provenance root.
+
+    Creates the project if it doesn't exist. Re-ingesting identical text
+    returns the same content_hash without duplicating the source row.
+
+    Args:
+      project_name: name for the project (used for create-or-lookup).
+      pdr_title: title of the PDR document.
+      pdr_text: full text of the PDR.
+      project_id: optional UUID — use existing project instead of creating.
+      stack: optional tech stack hint (stored in project metadata).
+      policy_profile: optional policy profile name.
+
+    Returns {project_id, requirement_source_id, content_hash, was_duplicate}.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.ingest_pdr(
+            conn, project_name=project_name, pdr_title=pdr_title,
+            pdr_text=pdr_text, project_id=project_id,
+            stack=stack, policy_profile=policy_profile,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def record_requirements(
+    project_id: str,
+    requirement_source_id: str,
+    requirements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Submit extracted requirements from a PDR for validation and storage.
+
+    Each requirement must be atomic (one testable need), have non-empty
+    acceptance_criteria, a valid priority, and a source_span linking it
+    back to the PDR text.
+
+    Args:
+      project_id: UUID of the project.
+      requirement_source_id: UUID from ingest_pdr.
+      requirements: list of {text, priority, acceptance_criteria,
+        source_span, slug?, constraints?[]}.
+        priority: 'must' | 'should' | 'could' | 'wont'.
+        source_span: {start, end, quote} pointing into the PDR.
+        constraints: optional [{kind, ...}] for requirement_constraint rows.
+
+    Returns {project_id, requirement_source_id, requirements: [{req_id,
+    slug, valid, errors}]}.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.record_requirements(
+            conn, project_id=project_id,
+            requirement_source_id=requirement_source_id,
+            requirements=requirements,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def search_for_requirement(
+    req_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Run registry search + fit evaluation for one requirement.
+
+    Returns existing fit evaluations and candidates for the requirement.
+    Call this before record_decision — a BUILD verdict is refused without
+    a prior search.
+
+    Args:
+      req_id: UUID of the project_requirement row.
+
+    Returns {req_id, slug, description, constraints, candidates[],
+    candidate_count} or None if not found.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.search_for_requirement(conn, req_id=req_id)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def record_decision(
+    req_id: str,
+    verdict: str,
+    chosen_capability_version_id: Optional[str] = None,
+    evidence_refs: Optional[list[str]] = None,
+    rationale: str = "",
+) -> Optional[dict[str, Any]]:
+    """
+    Record the reuse/build verdict for a requirement.
+
+    Enforces search-before-build: BUILD is refused unless a search
+    (fit_evaluation) exists for the requirement. Reuse verdicts require
+    a pinned capability_version_id.
+
+    Args:
+      req_id: UUID of the project_requirement.
+      verdict: one of ADOPT, ADAPT, WRAP, REFERENCE, REJECT, BUILD.
+      chosen_capability_version_id: required for ADOPT/ADAPT/WRAP/REFERENCE.
+      evidence_refs: optional list of evidence item UUIDs.
+      rationale: free-text reason for the decision.
+
+    Returns {recommendation_id, verdict} or {refused, reason} or None.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.record_decision(
+            conn, req_id=req_id, verdict=verdict,
+            chosen_capability_version_id=chosen_capability_version_id,
+            evidence_refs=evidence_refs, rationale=rationale,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def pdr_approval_brief(
+    project_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Render the plain-language approval brief for a project.
+
+    READ-ONLY — writes nothing. Shows every requirement's decision,
+    flags items needing human approval (paid services, unusual licenses,
+    vendor lock-in, security implications).
+
+    Args:
+      project_id: UUID of the project.
+
+    Returns {brief_markdown, decisions[], human_approval_items[],
+    unresolved[]} or None if project not found.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.build_approval_brief(conn, project_id=project_id)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def lock_architecture(
+    project_id: str,
+    approved_by: str,
+    approval_note: Optional[str] = None,
+    unresolved_risks: Optional[list[str]] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Freeze approved decisions into a versioned, append-only lock.
+
+    Supersedes any existing active lock and creates a new version.
+    All requirements must have a recorded decision before locking.
+
+    Args:
+      project_id: UUID of the project.
+      approved_by: who is approving (actor name).
+      approval_note: optional note for the audit trail.
+      unresolved_risks: optional list of known risks to record.
+
+    Returns {architecture_lock_id, version, source_lock_hash,
+    decision_count} or {refused, reason} or None.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.lock_architecture(
+            conn, project_id=project_id, approved_by=approved_by,
+            approval_note=approval_note, unresolved_risks=unresolved_risks,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def check_against_lock(
+    project_id: str,
+    proposed_change: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """
+    Test a proposed change against the active architecture lock.
+
+    READ-ONLY — writes nothing. Returns whether the change is allowed
+    or needs approval.
+
+    Args:
+      project_id: UUID of the project.
+      proposed_change: {req_ids?, provider?, capability_version_id?,
+        description} describing the proposed change.
+
+    Returns {verdict: 'allowed'|'needs_approval', reason} or None.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.check_against_lock(
+            conn, project_id=project_id, proposed_change=proposed_change,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def record_build_progress(
+    project_id: Optional[str] = None,
+    architecture_lock_id: Optional[str] = None,
+    title: Optional[str] = None,
+    objective: Optional[str] = None,
+    req_ids: Optional[list[str]] = None,
+    permitted_paths: Optional[list[str]] = None,
+    prohibited_changes: Optional[list[str]] = None,
+    reused_capability_version_id: Optional[str] = None,
+    build_task_id: Optional[str] = None,
+    status: Optional[str] = None,
+    target_commit: Optional[str] = None,
+    verification: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Record coding tasks and link built modules/tests to requirements.
+
+    Two modes:
+    - Create: provide project_id, architecture_lock_id, title, objective,
+      req_ids. Returns {build_task_id, status}.
+    - Update: provide build_task_id with optional status, target_commit,
+      verification. Returns {build_task_id, status}.
+
+    Args:
+      project_id: UUID (create mode).
+      architecture_lock_id: UUID (create mode).
+      title: task title (create mode).
+      objective: what this task accomplishes (create mode).
+      req_ids: list of requirement UUIDs this task satisfies (create mode).
+      permitted_paths: optional file paths this task may touch.
+      prohibited_changes: optional architectural changes forbidden.
+      reused_capability_version_id: optional UUID for reuse tasks.
+      build_task_id: UUID (update mode).
+      status: planned|in_progress|implemented|verified|abandoned.
+      target_commit: commit SHA in the target repo.
+      verification: {req_id, outcome, evidence_ref} to record.
+
+    Returns {build_task_id, status} or {error}.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.record_build_progress(
+            conn, project_id=project_id,
+            architecture_lock_id=architecture_lock_id,
+            title=title, objective=objective,
+            req_ids=req_ids, permitted_paths=permitted_paths,
+            prohibited_changes=prohibited_changes,
+            reused_capability_version_id=reused_capability_version_id,
+            build_task_id=build_task_id, status=status,
+            target_commit=target_commit, verification=verification,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def pdr_coverage(
+    project_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Report PDR implementation progress.
+
+    READ-ONLY — writes nothing. Shows how much of the PDR is decided,
+    tasked, implemented, and verified.
+
+    Args:
+      project_id: UUID of the project.
+
+    Returns {project_id, project_name, total_requirements, decided,
+    tasked, implemented, verified, by_requirement[]} or None.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.coverage(conn, project_id=project_id)
     finally:
         conn.close()
 
