@@ -30,6 +30,7 @@ from mcp_server.pdr_queries import (
     record_requirements,
     search_for_requirement,
 )
+from mcp_server import queries
 
 
 SAMPLE_PDR = """
@@ -685,3 +686,165 @@ class TestEndToEnd:
         assert cov["total_requirements"] == 3
         assert cov["decided"] == 3
         assert cov["verified"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Wired search+fit pipeline tests
+# ---------------------------------------------------------------------------
+
+def _setup_searchable_capability(conn, name="oauth-library", display="OAuth Library"):
+    """Create a capability with full source binding + scorecard so it's
+    searchable and _load_candidate_inputs can build a CandidateInputs."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO source_provider (name, kind) VALUES ('test-gh', 'code_host') "
+            "ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+        )
+        prov_id = cur.fetchone()[0]
+
+        cur.execute(
+            "INSERT INTO source_asset (provider_id, external_key, display_name, kind) "
+            "VALUES (%s, %s, %s, 'repository') RETURNING id",
+            (prov_id, f"test/{name}", f"test/{name}"),
+        )
+        asset_id = cur.fetchone()[0]
+
+        cur.execute(
+            "INSERT INTO source_revision (source_asset_id, revision_key) "
+            "VALUES (%s, 'abc123') RETURNING id",
+            (asset_id,),
+        )
+        rev_id = cur.fetchone()[0]
+
+        cur.execute(
+            "INSERT INTO capability (normalized_key, display_name, ecosystem, kind, component_kind) "
+            "VALUES (%s, %s, 'pypi', 'library', 'library') RETURNING id",
+            (f"pypi:{name}", display),
+        )
+        cap_id = cur.fetchone()[0]
+
+        cur.execute(
+            "INSERT INTO capability_version (capability_id, version_key, version_kind, display_version) "
+            "VALUES (%s, 'content:v1', 'content-hash', '1.0.0') RETURNING id",
+            (str(cap_id),),
+        )
+        cv_id = cur.fetchone()[0]
+
+        cur.execute(
+            "INSERT INTO capability_source_binding (capability_version_id, source_revision_id) "
+            "VALUES (%s, %s)",
+            (str(cv_id), str(rev_id)),
+        )
+
+        cur.execute(
+            "INSERT INTO scoring_profile (name, version, profile_hash, dimensions) "
+            "VALUES (%s, 1, %s, '{}'::jsonb) RETURNING id",
+            (f"prof-{uuid.uuid4().hex[:6]}", uuid.uuid4().hex),
+        )
+        profile_id = cur.fetchone()[0]
+
+        cur.execute(
+            "INSERT INTO scorecard (capability_version_id, scoring_profile_id, "
+            "total_score, confidence, computed_hash) "
+            "VALUES (%s, %s, 0.85, 0.9, %s)",
+            (str(cv_id), str(profile_id), uuid.uuid4().hex),
+        )
+
+    conn.commit()
+    return str(cap_id), str(cv_id)
+
+
+class TestWiredSearch:
+
+    def test_search_finds_capability_and_creates_fit(self, conn):
+        """search_for_requirement with a matching query should find the
+        capability and create fit_evaluation rows."""
+        cap_id, cv_id = _setup_searchable_capability(conn)
+        pid, sid, req_ids = _setup_full(conn)
+
+        result = search_for_requirement(
+            conn, req_id=req_ids[0], search_query="OAuth",
+        )
+        assert result is not None
+        assert result["search_query"] == "OAuth"
+        assert result["candidate_count"] >= 1
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM fit_evaluation WHERE project_requirement_id = %s",
+                (req_ids[0],),
+            )
+            assert cur.fetchone()[0] >= 1
+
+    def test_search_returns_project_id(self, conn):
+        pid, sid, req_ids = _setup_full(conn)
+        result = search_for_requirement(conn, req_id=req_ids[0])
+        assert result is not None
+        assert result["project_id"] == pid
+
+    def test_search_with_no_matches_returns_empty_candidates(self, conn):
+        pid, sid, req_ids = _setup_full(conn)
+        result = search_for_requirement(
+            conn, req_id=req_ids[0], search_query="zzz_nonexistent_xyz",
+        )
+        assert result is not None
+        assert result["candidate_count"] == 0
+
+    def test_search_uses_description_as_default_query(self, conn):
+        """When search_query is not provided, uses the requirement description."""
+        cap_id, cv_id = _setup_searchable_capability(
+            conn, name="file-uploader", display="File Uploader Library",
+        )
+        pid, sid, req_ids = _setup_full(conn)
+
+        result = search_for_requirement(conn, req_id=req_ids[1])
+        assert result is not None
+        assert result["search_query"] is not None
+        assert "File upload" in result["search_query"]
+
+    def test_search_with_ecosystem_filter(self, conn):
+        cap_id, cv_id = _setup_searchable_capability(conn)
+        pid, sid, req_ids = _setup_full(conn)
+
+        result = search_for_requirement(
+            conn, req_id=req_ids[0], search_query="OAuth",
+            ecosystem="npm",
+        )
+        assert result is not None
+        assert result["candidate_count"] == 0
+
+    def test_search_enables_build_decision(self, conn):
+        """After search creates fit_evaluation, BUILD verdict should succeed."""
+        cap_id, cv_id = _setup_searchable_capability(conn)
+        pid, sid, req_ids = _setup_full(conn)
+
+        search_for_requirement(
+            conn, req_id=req_ids[0], search_query="OAuth",
+        )
+
+        dec = record_decision(
+            conn, req_id=req_ids[0], verdict="BUILD",
+            rationale="No good match, building custom",
+        )
+        assert dec is not None
+        assert dec.get("refused") is None
+        assert dec["verdict"] == "BUILD"
+
+    def test_search_enables_adopt_decision(self, conn):
+        """After search with a found capability, ADOPT verdict should work."""
+        cap_id, cv_id = _setup_searchable_capability(conn)
+        pid, sid, req_ids = _setup_full(conn)
+
+        result = search_for_requirement(
+            conn, req_id=req_ids[0], search_query="OAuth",
+        )
+        assert result["candidate_count"] >= 1
+
+        dec = record_decision(
+            conn, req_id=req_ids[0], verdict="ADOPT",
+            chosen_capability_version_id=cv_id,
+            rationale="Good fit",
+        )
+        assert dec is not None
+        assert dec.get("refused") is None
+        assert dec["verdict"] == "ADOPT"

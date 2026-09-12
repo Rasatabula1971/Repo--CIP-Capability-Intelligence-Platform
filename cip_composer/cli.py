@@ -710,6 +710,133 @@ def cmd_pdr_coverage(args) -> int:
     return 0
 
 
+def cmd_search_for_requirement(args) -> int:
+    conn = connect()
+    try:
+        result = pdr_queries.search_for_requirement(
+            conn, req_id=args.req_id,
+            search_query=args.query,
+            ecosystem=args.ecosystem,
+            capability_kind=args.capability_kind,
+            component_kind=args.kind,
+            runtime=args.runtime,
+            cost_tier=args.cost_tier,
+            limit=args.limit,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("Requirement not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Requirement: {result['slug']} — {result['description']}")
+        if result["constraints"]:
+            print(f"Constraints: {len(result['constraints'])}")
+        print(f"Search query: {result.get('search_query', '(none)')}")
+        print(f"Candidates found: {result['candidate_count']}")
+        for c in result["candidates"]:
+            score = f"fit={c['fit_score']:.3f}"
+            gaps = f"gaps={c['blocking_gap_count']}"
+            intrinsic = f"score={c['intrinsic_score']:.3f}" if c['intrinsic_score'] else "score=n/a"
+            print(f"  {c['display_name']} ({c['ecosystem']}) — {score}, {gaps}, {intrinsic}")
+    return 0
+
+
+def cmd_record_decision(args) -> int:
+    conn = connect()
+    try:
+        result = pdr_queries.record_decision(
+            conn, req_id=args.req_id,
+            verdict=args.verdict.upper(),
+            chosen_capability_version_id=args.capability_version_id,
+            rationale=args.rationale or "",
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("Requirement not found")
+        return 1
+    if result.get("refused"):
+        print(f"Refused: {result['reason']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Recorded: {result['verdict']} → recommendation {result['recommendation_id']}")
+    return 0
+
+
+def cmd_check_against_lock(args) -> int:
+    proposed = {"description": args.description or ""}
+    if args.capability_version_id:
+        proposed["capability_version_id"] = args.capability_version_id
+    if args.provider:
+        proposed["provider"] = args.provider
+
+    conn = connect()
+    try:
+        result = pdr_queries.check_against_lock(
+            conn, project_id=args.project_id,
+            proposed_change=proposed,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("Project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Verdict: {result['verdict']}")
+        print(f"Reason: {result['reason']}")
+    return 0
+
+
+def cmd_record_build_progress(args) -> int:
+    conn = connect()
+    try:
+        if args.build_task_id:
+            verification = None
+            if args.verify_req_id and args.verify_outcome:
+                verification = {
+                    "req_id": args.verify_req_id,
+                    "outcome": args.verify_outcome,
+                    "evidence_ref": args.verify_evidence,
+                }
+            result = pdr_queries.record_build_progress(
+                conn,
+                build_task_id=args.build_task_id,
+                status=args.status,
+                target_commit=args.target_commit,
+                verification=verification,
+            )
+        else:
+            req_ids = [r.strip() for r in args.req_ids.split(",")]
+            result = pdr_queries.record_build_progress(
+                conn,
+                project_id=args.project_id,
+                architecture_lock_id=args.lock_id,
+                title=args.title,
+                objective=args.objective,
+                req_ids=req_ids,
+            )
+    finally:
+        conn.close()
+    if result is None:
+        print("Not found")
+        return 1
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Task {result['build_task_id']} — status: {result['status']}")
+    return 0
+
+
 def cmd_pdr_brief(args) -> int:
     conn = connect()
     try:
@@ -998,6 +1125,63 @@ def _build_parser() -> argparse.ArgumentParser:
     pb.add_argument("project_id", help="UUID of the project.")
     pb.add_argument("--json", action="store_true")
     pb.set_defaults(func=cmd_pdr_brief)
+
+    sr = subs.add_parser("search-for-requirement",
+                          help="Search registry and compute fit for a requirement.")
+    sr.add_argument("req_id", help="UUID of the project_requirement.")
+    sr.add_argument("--query", default=None,
+                     help="Search query (defaults to requirement description).")
+    sr.add_argument("--ecosystem", default=None)
+    sr.add_argument("--capability-kind", dest="capability_kind", default=None)
+    sr.add_argument("--kind", default=None, help="Filter by component_kind.")
+    sr.add_argument("--runtime", default=None)
+    sr.add_argument("--cost-tier", dest="cost_tier", default=None)
+    sr.add_argument("--limit", type=int, default=20)
+    sr.add_argument("--json", action="store_true")
+    sr.set_defaults(func=cmd_search_for_requirement)
+
+    rd = subs.add_parser("record-decision",
+                          help="Record a reuse/build verdict for a requirement.")
+    rd.add_argument("req_id", help="UUID of the project_requirement.")
+    rd.add_argument("verdict", help="ADOPT, ADAPT, WRAP, REFERENCE, REJECT, or BUILD.")
+    rd.add_argument("--capability-version-id", dest="capability_version_id", default=None,
+                     help="Required for ADOPT/ADAPT/WRAP/REFERENCE.")
+    rd.add_argument("--rationale", default=None, help="Free-text reason.")
+    rd.add_argument("--json", action="store_true")
+    rd.set_defaults(func=cmd_record_decision)
+
+    ca_lock = subs.add_parser("check-against-lock",
+                               help="Check a proposed change against the architecture lock.")
+    ca_lock.add_argument("project_id", help="UUID of the project.")
+    ca_lock.add_argument("--description", default=None, help="Description of the change.")
+    ca_lock.add_argument("--capability-version-id", dest="capability_version_id", default=None)
+    ca_lock.add_argument("--provider", default=None, help="Provider name to check.")
+    ca_lock.add_argument("--json", action="store_true")
+    ca_lock.set_defaults(func=cmd_check_against_lock)
+
+    bp = subs.add_parser("record-build-progress",
+                          help="Create or update a build task.")
+    bp.add_argument("--build-task-id", dest="build_task_id", default=None,
+                     help="UUID of existing task (update mode).")
+    bp.add_argument("--project-id", dest="project_id", default=None,
+                     help="UUID of project (create mode).")
+    bp.add_argument("--lock-id", dest="lock_id", default=None,
+                     help="UUID of architecture_lock (create mode).")
+    bp.add_argument("--title", default=None, help="Task title (create mode).")
+    bp.add_argument("--objective", default=None, help="Task objective (create mode).")
+    bp.add_argument("--req-ids", dest="req_ids", default=None,
+                     help="Comma-separated requirement UUIDs (create mode).")
+    bp.add_argument("--status", default=None,
+                     help="New status (update mode): planned/in_progress/implemented/verified/abandoned.")
+    bp.add_argument("--target-commit", dest="target_commit", default=None)
+    bp.add_argument("--verify-req-id", dest="verify_req_id", default=None,
+                     help="Requirement UUID to verify (update mode).")
+    bp.add_argument("--verify-outcome", dest="verify_outcome", default=None,
+                     help="Verification outcome: pass/fail/not_run.")
+    bp.add_argument("--verify-evidence", dest="verify_evidence", default=None,
+                     help="Evidence reference for verification.")
+    bp.add_argument("--json", action="store_true")
+    bp.set_defaults(func=cmd_record_build_progress)
 
     i = subs.add_parser("info", help="Registry stats.")
     i.set_defaults(func=cmd_info)

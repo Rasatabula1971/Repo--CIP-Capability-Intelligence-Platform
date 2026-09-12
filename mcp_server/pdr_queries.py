@@ -16,11 +16,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import uuid
 from typing import Any, Optional
 
 import psycopg
+
+from core.project.fit import evaluate_fit
+from core.project.types import (
+    CandidateInputs,
+    Constraint,
+    DependencyEvidence,
+    FitResult,
+    InterfaceEvidence,
+    LicenseEvidence,
+    Requirement,
+)
+from mcp_server.queries import search_capabilities
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +58,202 @@ def _slugify(text: str) -> str:
     s = text.lower().strip()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     return s.strip("-")[:80]
+
+
+# ---------------------------------------------------------------------------
+# Candidate loading + fit persistence (shared with search_for_requirement)
+# ---------------------------------------------------------------------------
+
+def _load_candidate_inputs(
+    conn: psycopg.Connection, cv_id: str,
+) -> CandidateInputs | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(MAX(total_score), 0.0) FROM scorecard "
+            "WHERE capability_version_id = %s",
+            (cv_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        intrinsic_score = float(row[0])
+
+        cur.execute(
+            """
+            SELECT sr.revision_key, sa.external_key
+            FROM capability_source_binding csb
+            JOIN source_revision sr ON sr.id = csb.source_revision_id
+            JOIN source_asset sa    ON sa.id = sr.source_asset_id
+            WHERE csb.capability_version_id = %s
+            ORDER BY sr.identified_at DESC
+            LIMIT 1
+            """,
+            (cv_id,),
+        )
+        binding = cur.fetchone()
+        if not binding:
+            return None
+        pinned_revision_key, pinned_source_asset_key = binding
+
+        cur.execute(
+            """
+            SELECT evidence_item_id, kind, name,
+                   COALESCE(signature, ''), language
+            FROM capability_interface
+            WHERE capability_version_id = %s
+            ORDER BY name
+            """,
+            (cv_id,),
+        )
+        interfaces = tuple(
+            InterfaceEvidence(
+                evidence_item_id=str(r[0]),
+                kind=r[1], name=r[2], signature=r[3], language=r[4],
+            )
+            for r in cur.fetchall()
+        )
+
+        cur.execute(
+            """
+            SELECT evidence_item_id, depends_on_ecosystem,
+                   depends_on_name, dep_kind
+            FROM capability_dependency
+            WHERE capability_version_id = %s
+            ORDER BY depends_on_ecosystem, depends_on_name
+            """,
+            (cv_id,),
+        )
+        deps = tuple(
+            DependencyEvidence(
+                evidence_item_id=str(r[0]),
+                ecosystem=r[1], name=r[2], kind=r[3],
+            )
+            for r in cur.fetchall()
+        )
+
+        cur.execute(
+            """
+            SELECT ei.id, ei.extracted_value
+            FROM evidence_item ei
+            JOIN capability_source_binding csb
+              ON csb.source_revision_id = ei.source_revision_id
+            WHERE csb.capability_version_id = %s
+              AND ei.evidence_type = 'license'
+            ORDER BY ei.id
+            """,
+            (cv_id,),
+        )
+        licenses = tuple(
+            LicenseEvidence(
+                evidence_item_id=str(r[0]),
+                spdx_id=r[1].get("spdx_id", "unknown") if r[1] else "unknown",
+            )
+            for r in cur.fetchall()
+        )
+
+    return CandidateInputs(
+        capability_version_id=cv_id,
+        intrinsic_score=intrinsic_score,
+        interfaces=interfaces,
+        dependencies=deps,
+        licenses=licenses,
+        pinned_revision_key=pinned_revision_key,
+        pinned_source_asset_key=pinned_source_asset_key,
+    )
+
+
+def _persist_fit_evaluation(
+    conn: psycopg.Connection,
+    *,
+    project_requirement_id: str,
+    candidate: CandidateInputs,
+    fit_result: FitResult,
+) -> str:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO fit_evaluation
+              (project_requirement_id, capability_version_id,
+               fit_score, blocking_gap_count, computed_hash)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (project_requirement_id, capability_version_id)
+              DO UPDATE SET fit_score = EXCLUDED.fit_score,
+                            blocking_gap_count = EXCLUDED.blocking_gap_count,
+                            computed_hash = EXCLUDED.computed_hash,
+                            computed_at = now()
+            RETURNING id
+            """,
+            (
+                project_requirement_id,
+                candidate.capability_version_id,
+                fit_result.fit_score,
+                fit_result.blocking_gap_count,
+                fit_result.computed_hash,
+            ),
+        )
+        fit_id = str(cur.fetchone()[0])
+
+        cur.execute("DELETE FROM fit_gap WHERE fit_evaluation_id = %s", (fit_id,))
+        cur.execute("DELETE FROM fit_evidence_link WHERE fit_evaluation_id = %s", (fit_id,))
+
+        for gap in fit_result.gaps:
+            cur.execute(
+                """
+                INSERT INTO fit_gap (fit_evaluation_id, kind, is_blocking, detail)
+                VALUES (%s, %s, %s, %s::jsonb)
+                """,
+                (fit_id, gap.kind, gap.is_blocking, json.dumps(gap.detail)),
+            )
+        for link in fit_result.evidence_links:
+            cur.execute(
+                """
+                INSERT INTO fit_evidence_link (fit_evaluation_id, evidence_item_id, role)
+                VALUES (%s, %s, %s)
+                """,
+                (fit_id, link.evidence_item_id, link.role),
+            )
+
+    return fit_id
+
+
+def _read_fit_evaluations(
+    conn: psycopg.Connection, req_id: str,
+) -> list[dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT fe.id, fe.capability_version_id, fe.fit_score,
+                   fe.blocking_gap_count, fe.computed_hash,
+                   cv.display_version,
+                   c.normalized_key, c.display_name, c.ecosystem,
+                   c.component_kind, c.runtime, c.cost_tier,
+                   cs.total_score
+            FROM fit_evaluation fe
+            JOIN capability_version cv ON cv.id = fe.capability_version_id
+            JOIN capability c ON c.id = cv.capability_id
+            LEFT JOIN component_score cs ON cs.capability_id = c.id
+            WHERE fe.project_requirement_id = %s
+            ORDER BY fe.fit_score DESC, cs.total_score DESC NULLS LAST
+            """,
+            (req_id,),
+        )
+        candidates = []
+        for r in cur.fetchall():
+            candidates.append({
+                "fit_evaluation_id": str(r[0]),
+                "capability_version_id": str(r[1]),
+                "fit_score": float(r[2]),
+                "blocking_gap_count": r[3],
+                "display_version": r[5],
+                "normalized_key": r[6],
+                "display_name": r[7],
+                "ecosystem": r[8],
+                "component_kind": r[9],
+                "runtime": r[10],
+                "cost_tier": r[11],
+                "intrinsic_score": float(r[12]) if r[12] else None,
+            })
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +450,13 @@ def search_for_requirement(
     conn: psycopg.Connection,
     *,
     req_id: str,
+    search_query: str | None = None,
+    ecosystem: str | None = None,
+    capability_kind: str | None = None,
+    component_kind: str | None = None,
+    runtime: str | None = None,
+    cost_tier: str | None = None,
+    limit: int = 20,
 ) -> dict[str, Any] | None:
     if not _is_uuid(req_id):
         return None
@@ -260,49 +478,60 @@ def search_for_requirement(
             "SELECT kind, detail FROM requirement_constraint WHERE project_requirement_id = %s",
             (req_id,),
         )
-        constraints = [{"kind": r[0], "detail": r[1]} for r in cur.fetchall()]
+        constraint_rows = cur.fetchall()
 
-        cur.execute(
-            """
-            SELECT fe.id, fe.capability_version_id, fe.fit_score,
-                   fe.blocking_gap_count, fe.computed_hash,
-                   cv.display_version,
-                   c.normalized_key, c.display_name, c.ecosystem,
-                   c.component_kind, c.runtime, c.cost_tier,
-                   cs.total_score
-            FROM fit_evaluation fe
-            JOIN capability_version cv ON cv.id = fe.capability_version_id
-            JOIN capability c ON c.id = cv.capability_id
-            LEFT JOIN component_score cs ON cs.capability_id = c.id
-            WHERE fe.project_requirement_id = %s
-            ORDER BY fe.fit_score DESC, cs.total_score DESC NULLS LAST
-            """,
-            (req_id,),
+    constraints = [{"kind": r[0], "detail": r[1]} for r in constraint_rows]
+    project_id = str(req_row[3])
+
+    query_text = (search_query or req_row[2] or "").strip()
+    if query_text:
+        search_results = search_capabilities(
+            conn, query_text,
+            ecosystem=ecosystem,
+            capability_kind=capability_kind,
+            component_kind=component_kind,
+            runtime=runtime,
+            cost_tier=cost_tier,
+            project_id=project_id,
+            limit=limit,
         )
-        candidates = []
-        for r in cur.fetchall():
-            candidates.append({
-                "fit_evaluation_id": str(r[0]),
-                "capability_version_id": str(r[1]),
-                "fit_score": float(r[2]),
-                "blocking_gap_count": r[3],
-                "display_version": r[5],
-                "normalized_key": r[6],
-                "display_name": r[7],
-                "ecosystem": r[8],
-                "component_kind": r[9],
-                "runtime": r[10],
-                "cost_tier": r[11],
-                "intrinsic_score": float(r[12]) if r[12] else None,
-            })
+
+        requirement = Requirement(
+            id=req_id,
+            slug=req_row[1],
+            description=req_row[2] or "",
+            constraints=tuple(
+                Constraint(kind=r[0], detail=r[1]) for r in constraint_rows
+            ),
+        )
+
+        for sr in search_results:
+            cv_id = sr.get("head_version_id")
+            if not cv_id:
+                continue
+            inputs = _load_candidate_inputs(conn, cv_id)
+            if inputs is None:
+                continue
+            fit_result = evaluate_fit(requirement, inputs)
+            _persist_fit_evaluation(
+                conn,
+                project_requirement_id=req_id,
+                candidate=inputs,
+                fit_result=fit_result,
+            )
+        conn.commit()
+
+    candidates = _read_fit_evaluations(conn, req_id)
 
     return {
         "req_id": req_id,
         "slug": req_row[1],
         "description": req_row[2],
+        "project_id": project_id,
         "constraints": constraints,
         "candidates": candidates,
         "candidate_count": len(candidates),
+        "search_query": query_text or None,
     }
 
 

@@ -977,23 +977,47 @@ def record_requirements(
 @mcp.tool()
 def search_for_requirement(
     req_id: str,
+    search_query: Optional[str] = None,
+    ecosystem: Optional[str] = None,
+    capability_kind: Optional[str] = None,
+    component_kind: Optional[str] = None,
+    runtime: Optional[str] = None,
+    cost_tier: Optional[str] = None,
+    limit: int = 20,
 ) -> Optional[dict[str, Any]]:
     """
-    Run registry search + fit evaluation for one requirement.
+    Search the CIP registry and compute fit for one requirement.
 
-    Returns existing fit evaluations and candidates for the requirement.
-    Call this before record_decision — a BUILD verdict is refused without
-    a prior search.
+    Searches the capability registry using search_query (defaults to the
+    requirement description), evaluates fit against each candidate, and
+    persists fit_evaluation rows. Call this before record_decision — a
+    BUILD verdict is refused without a prior search.
 
     Args:
       req_id: UUID of the project_requirement row.
+      search_query: text to search for (defaults to requirement description).
+      ecosystem: filter by ecosystem (pypi, npm, source, ...).
+      capability_kind: filter by semantic role (library, cli, service, ...).
+      component_kind: filter by format (library, repo, agent, ...).
+      runtime: filter by runtime (python_import, mcp_stdio, ...).
+      cost_tier: filter by cost (free, free_tier, cheap_paid, paid).
+      limit: max candidates to evaluate (default 20).
 
     Returns {req_id, slug, description, constraints, candidates[],
-    candidate_count} or None if not found.
+    candidate_count, search_query} or None if not found.
     """
     conn = connect()
     try:
-        return pdr_queries.search_for_requirement(conn, req_id=req_id)
+        return pdr_queries.search_for_requirement(
+            conn, req_id=req_id,
+            search_query=search_query,
+            ecosystem=ecosystem,
+            capability_kind=capability_kind,
+            component_kind=component_kind,
+            runtime=runtime,
+            cost_tier=cost_tier,
+            limit=limit,
+        )
     finally:
         conn.close()
 
