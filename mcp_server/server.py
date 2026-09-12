@@ -26,6 +26,7 @@ from analysis.extractors import extractor_names as _extractor_names
 from db.connection import connect
 from mcp_server import queries
 from mcp_server import pdr_queries
+from mcp_server import eval_queries
 
 
 mcp = FastMCP("cip")
@@ -1316,6 +1317,124 @@ def fair_status() -> dict[str, Any]:
         "api_url": client.api_url,
         "client_id": client.client_id,
     }
+
+
+# -----------------------------------------------------------------------
+# Evaluation store tools (repo-scout / co-work asset evaluations)
+# -----------------------------------------------------------------------
+
+@mcp.tool()
+def record_evaluation(
+    asset_slug: str,
+    verdict: str,
+    asset_type: str = "repo",
+    url: Optional[str] = None,
+    code_quality: Optional[str] = None,
+    banked: bool = False,
+    summary: str = "",
+    code_quality_notes: str = "",
+    useful_parts: str = "",
+    skip_notes: str = "",
+    banked_references: Optional[list[dict]] = None,
+    projects: Optional[list[str]] = None,
+    problem_types: Optional[list[str]] = None,
+    license_notes: str = "",
+    cip_status: str = "not-ingested",
+    evaluated_at: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Record an asset evaluation in the durable evaluation store.
+
+    Upserts by asset_slug — re-evaluating the same asset overwrites the
+    prior row. This is the proper home for repo-scout / co-work verdicts,
+    replacing lossy markdown files. Save every evaluation in bucket 1
+    (fits a project) or bucket 2 (banked); skip only pure junk.
+
+    Args:
+      asset_slug: unique slug, e.g. 'msitarzewski-agency-agents'.
+      verdict: Adopt | Adapt | Reference | Reject | Build.
+      asset_type: repo | skill | agent | mcp_server | prompt | workflow.
+      url: source URL.
+      code_quality: solid | acceptable | fragile | untested.
+      banked: true if worth keeping for the future regardless of project fit.
+      summary: one-sentence what-it-is.
+      code_quality_notes: what you found reading the source.
+      useful_parts: specific files/patterns worth using.
+      skip_notes: what to ignore.
+      banked_references: list of {file, problem, why} dicts.
+      projects: current projects it fits (or []).
+      problem_types: problem-category tags — the primary recall key.
+      license_notes: SPDX + implications.
+      cip_status: ingested | not-ingested.
+      evaluated_at: 'YYYY-MM-DD'.
+
+    Returns the stored evaluation, or {"error": ...} on invalid input.
+    """
+    conn = connect()
+    try:
+        return eval_queries.record_evaluation(
+            conn, asset_slug=asset_slug, verdict=verdict, asset_type=asset_type,
+            url=url, code_quality=code_quality, banked=banked, summary=summary,
+            code_quality_notes=code_quality_notes, useful_parts=useful_parts,
+            skip_notes=skip_notes, banked_references=banked_references,
+            projects=projects, problem_types=problem_types,
+            license_notes=license_notes, cip_status=cip_status,
+            evaluated_at=evaluated_at,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def search_evaluations(
+    query: Optional[str] = None,
+    problem_types: Optional[list[str]] = None,
+    verdict: Optional[str] = None,
+    asset_type: Optional[str] = None,
+    banked: Optional[bool] = None,
+    project: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """
+    Search the evaluation store. Call this before building — it surfaces
+    prior verdicts and banked references so nothing is re-evaluated.
+
+    Args:
+      query: substring across asset_slug, summary, useful_parts.
+      problem_types: rows whose tags overlap ANY of these (primary recall).
+      verdict: filter by verdict.
+      asset_type: filter by asset type.
+      banked: true to see only banked-for-future references.
+      project: rows whose projects array contains this project.
+      limit: max rows (1-500, default 50).
+
+    Returns evaluation rows, newest first.
+    """
+    conn = connect()
+    try:
+        return eval_queries.search_evaluations(
+            conn, query=query, problem_types=problem_types, verdict=verdict,
+            asset_type=asset_type, banked=banked, project=project, limit=limit,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_evaluation(asset_slug: str) -> Optional[dict[str, Any]]:
+    """
+    Fetch one evaluation by slug.
+
+    Args:
+      asset_slug: the unique slug used when it was recorded.
+
+    Returns the full evaluation row, or None if not found.
+    """
+    conn = connect()
+    try:
+        return eval_queries.get_evaluation(conn, asset_slug=asset_slug)
+    finally:
+        conn.close()
 
 
 def main() -> None:

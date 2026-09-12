@@ -38,6 +38,7 @@ from analysis.extractors import extractor_names as _extractor_names
 from db.connection import connect
 from mcp_server import queries
 from mcp_server import pdr_queries
+from mcp_server import eval_queries
 from scripts.compose.scaffold_pipeline import scaffold as _scaffold
 from scripts.compose.suggest_pipeline import (
     suggest_pipeline as _suggest,
@@ -939,6 +940,84 @@ def cmd_fair_status(args) -> int:
     return 0
 
 
+def cmd_eval_record(args) -> int:
+    payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    conn = connect()
+    try:
+        result = eval_queries.record_evaluation(
+            conn,
+            asset_slug=payload["asset_slug"],
+            verdict=payload["verdict"],
+            asset_type=payload.get("asset_type", "repo"),
+            url=payload.get("url"),
+            code_quality=payload.get("code_quality"),
+            banked=payload.get("banked", False),
+            summary=payload.get("summary", ""),
+            code_quality_notes=payload.get("code_quality_notes", ""),
+            useful_parts=payload.get("useful_parts", ""),
+            skip_notes=payload.get("skip_notes", ""),
+            banked_references=payload.get("banked_references"),
+            projects=payload.get("projects"),
+            problem_types=payload.get("problem_types"),
+            license_notes=payload.get("license_notes", ""),
+            cip_status=payload.get("cip_status", "not-ingested"),
+            evaluated_at=payload.get("evaluated_at"),
+        )
+    finally:
+        conn.close()
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        b = " [banked]" if result["banked"] else ""
+        print(f"Recorded: {result['asset_slug']} — {result['verdict']}{b}")
+    return 0
+
+
+def cmd_eval_search(args) -> int:
+    problem_types = [t.strip() for t in args.problem_types.split(",")
+                     if t.strip()] if args.problem_types else None
+    conn = connect()
+    try:
+        rows = eval_queries.search_evaluations(
+            conn,
+            query=args.query,
+            problem_types=problem_types,
+            verdict=args.verdict,
+            asset_type=args.asset_type,
+            banked=(True if args.banked else None),
+            project=args.project,
+            limit=args.limit,
+        )
+    finally:
+        conn.close()
+    if args.json:
+        _print_json(rows)
+    else:
+        if not rows:
+            print("(no evaluations)")
+        for r in rows:
+            b = " [banked]" if r["banked"] else ""
+            tags = ", ".join(r.get("problem_types") or [])
+            print(f"  {r['asset_slug']:35s}  {r['verdict']:10s}{b}  {tags}")
+    return 0
+
+
+def cmd_eval_get(args) -> int:
+    conn = connect()
+    try:
+        result = eval_queries.get_evaluation(conn, asset_slug=args.asset_slug)
+    finally:
+        conn.close()
+    if result is None:
+        print("Evaluation not found")
+        return 1
+    _print_json(result)
+    return 0
+
+
 def cmd_info(args) -> int:
     conn = connect()
     try:
@@ -1294,6 +1373,29 @@ def _build_parser() -> argparse.ArgumentParser:
     fst = subs.add_parser("fair-status", help="Check FAIR availability.")
     fst.add_argument("--json", action="store_true")
     fst.set_defaults(func=cmd_fair_status)
+
+    er = subs.add_parser("eval-record",
+                          help="Record an asset evaluation into the store (from a JSON file).")
+    er.add_argument("file", help="JSON file with the evaluation fields.")
+    er.add_argument("--json", action="store_true")
+    er.set_defaults(func=cmd_eval_record)
+
+    es = subs.add_parser("eval-search",
+                          help="Search the evaluation store (prior verdicts + banked references).")
+    es.add_argument("--query", default=None, help="Substring across slug/summary/useful_parts.")
+    es.add_argument("--problem-types", dest="problem_types", default=None,
+                     help="Comma-separated problem-type tags (overlap match).")
+    es.add_argument("--verdict", default=None)
+    es.add_argument("--asset-type", dest="asset_type", default=None)
+    es.add_argument("--project", default=None)
+    es.add_argument("--banked", action="store_true", help="Only banked-for-future entries.")
+    es.add_argument("--limit", type=int, default=50)
+    es.add_argument("--json", action="store_true")
+    es.set_defaults(func=cmd_eval_search)
+
+    eg = subs.add_parser("eval-get", help="Fetch one evaluation by slug.")
+    eg.add_argument("asset_slug", help="The unique slug.")
+    eg.set_defaults(func=cmd_eval_get)
 
     i = subs.add_parser("info", help="Registry stats.")
     i.set_defaults(func=cmd_info)
