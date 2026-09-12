@@ -853,6 +853,92 @@ def cmd_pdr_brief(args) -> int:
     return 0
 
 
+def cmd_fair_extract(args) -> int:
+    from integrations.fair_client import FairClient
+    from integrations.fair_pdr import extract_requirements
+    pdr_text = Path(args.file).read_text(encoding="utf-8")
+    client = FairClient()
+    result = extract_requirements(client, pdr_text)
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        reqs = result.get("requirements", [])
+        print(f"Extracted {len(reqs)} requirements "
+              f"(via {result.get('provider_id', '?')}/{result.get('model_id', '?')})")
+        for i, r in enumerate(reqs, 1):
+            prio = r.get("priority", "?")
+            print(f"  {i}. [{prio}] {r.get('text', '(no text)')}")
+    return 0
+
+
+def cmd_fair_suggest_verdict(args) -> int:
+    from integrations.fair_client import FairClient
+    from integrations.fair_pdr import suggest_verdict
+    candidates_data = json.loads(Path(args.candidates_file).read_text(encoding="utf-8"))
+    if isinstance(candidates_data, dict):
+        candidates_data = candidates_data.get("candidates", [candidates_data])
+    client = FairClient()
+    result = suggest_verdict(
+        client,
+        req_id=args.req_id,
+        description=args.description,
+        constraints=json.loads(args.constraints) if args.constraints else [],
+        candidates=candidates_data,
+    )
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Verdict: {result.get('verdict', '?')}")
+        print(f"Rationale: {result.get('rationale', '')}")
+        if result.get("chosen_capability_version_id"):
+            print(f"Chosen: {result['chosen_capability_version_id']}")
+    return 0
+
+
+def cmd_fair_analyze(args) -> int:
+    from integrations.fair_client import FairClient
+    from integrations.fair_pdr import analyze_source
+    source_code = Path(args.file).read_text(encoding="utf-8")
+    client = FairClient()
+    result = analyze_source(client, source_code, file_path=args.file)
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        caps = result.get("capabilities", [])
+        print(f"Found {len(caps)} capabilities "
+              f"(via {result.get('provider_id', '?')}/{result.get('model_id', '?')})")
+        for c in caps:
+            ifaces = len(c.get("interfaces", []))
+            deps = len(c.get("dependencies", []))
+            print(f"  {c.get('name', '?')} ({c.get('kind', '?')}) "
+                  f"— {ifaces} interfaces, {deps} deps")
+    return 0
+
+
+def cmd_fair_status(args) -> int:
+    from integrations.fair_client import FairClient
+    client = FairClient()
+    available = client.is_available()
+    if args.json:
+        _print_json({"available": available, "api_url": client.api_url,
+                      "client_id": client.client_id})
+    else:
+        status = "ONLINE" if available else "OFFLINE"
+        print(f"FAIR: {status}")
+        print(f"  URL: {client.api_url}")
+        print(f"  Client: {client.client_id}")
+    return 0
+
+
 def cmd_info(args) -> int:
     conn = connect()
     try:
@@ -1182,6 +1268,32 @@ def _build_parser() -> argparse.ArgumentParser:
                      help="Evidence reference for verification.")
     bp.add_argument("--json", action="store_true")
     bp.set_defaults(func=cmd_record_build_progress)
+
+    fe = subs.add_parser("fair-extract",
+                          help="Use FAIR to extract requirements from a PDR.")
+    fe.add_argument("file", help="Path to the PDR text file.")
+    fe.add_argument("--json", action="store_true")
+    fe.set_defaults(func=cmd_fair_extract)
+
+    fsv = subs.add_parser("fair-suggest-verdict",
+                           help="Use FAIR to suggest a verdict for a requirement.")
+    fsv.add_argument("req_id", help="UUID of the project_requirement.")
+    fsv.add_argument("description", help="Requirement description text.")
+    fsv.add_argument("candidates_file", help="JSON file with candidates array.")
+    fsv.add_argument("--constraints", default=None,
+                      help="JSON string of constraint dicts.")
+    fsv.add_argument("--json", action="store_true")
+    fsv.set_defaults(func=cmd_fair_suggest_verdict)
+
+    fa = subs.add_parser("fair-analyze",
+                          help="Use FAIR to analyze source code for capabilities.")
+    fa.add_argument("file", help="Path to the source file.")
+    fa.add_argument("--json", action="store_true")
+    fa.set_defaults(func=cmd_fair_analyze)
+
+    fst = subs.add_parser("fair-status", help="Check FAIR availability.")
+    fst.add_argument("--json", action="store_true")
+    fst.set_defaults(func=cmd_fair_status)
 
     i = subs.add_parser("info", help="Registry stats.")
     i.set_defaults(func=cmd_info)

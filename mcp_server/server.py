@@ -1219,6 +1219,105 @@ def pdr_coverage(
         conn.close()
 
 
+# -----------------------------------------------------------------------
+# FAIR integration tools
+# -----------------------------------------------------------------------
+
+@mcp.tool()
+def fair_extract_requirements(
+    pdr_text: str,
+) -> dict[str, Any]:
+    """
+    Use FAIR (free AI inference) to extract requirements from PDR text.
+
+    Sends the PDR to FAIR's /v1/solve endpoint which routes through
+    free models (Groq, OpenRouter free, Ollama) to extract structured
+    requirements ready for record_requirements.
+
+    Args:
+      pdr_text: the full PDR document text.
+
+    Returns {requirements[], fair_request_id, provider_id, model_id,
+    verification_state} or {error, requirements[]}.
+    """
+    from integrations.fair_client import FairClient
+    from integrations.fair_pdr import extract_requirements
+    client = FairClient()
+    return extract_requirements(client, pdr_text)
+
+
+@mcp.tool()
+def fair_suggest_verdict(
+    req_id: str,
+    description: str,
+    constraints: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Use FAIR to suggest a reuse/build verdict for a requirement.
+
+    Sends the requirement and search candidates to FAIR for
+    evaluation. Returns a recommended verdict (ADOPT/ADAPT/WRAP/
+    REFERENCE/REJECT/BUILD) with rationale.
+
+    Args:
+      req_id: UUID of the project_requirement.
+      description: the requirement description text.
+      constraints: list of constraint dicts from the requirement.
+      candidates: list of candidate dicts from search_for_requirement.
+
+    Returns {verdict, rationale, chosen_capability_version_id,
+    fair_request_id, ...} or {error}.
+    """
+    from integrations.fair_client import FairClient
+    from integrations.fair_pdr import suggest_verdict
+    client = FairClient()
+    return suggest_verdict(
+        client, req_id=req_id, description=description,
+        constraints=constraints, candidates=candidates,
+    )
+
+
+@mcp.tool()
+def fair_analyze_source(
+    source_code: str,
+    file_path: str = "<unknown>",
+) -> dict[str, Any]:
+    """
+    Use FAIR to analyze source code and identify capabilities.
+
+    Extracts capability metadata (name, kind, interfaces, dependencies)
+    from source code using free AI inference.
+
+    Args:
+      source_code: the source code text to analyze.
+      file_path: path to the file (for context in the prompt).
+
+    Returns {capabilities[], fair_request_id, provider_id, model_id}
+    or {error, capabilities[]}.
+    """
+    from integrations.fair_client import FairClient
+    from integrations.fair_pdr import analyze_source
+    client = FairClient()
+    return analyze_source(client, source_code, file_path)
+
+
+@mcp.tool()
+def fair_status() -> dict[str, Any]:
+    """
+    Check whether FAIR is reachable and configured.
+
+    Returns {available, api_url, client_id}.
+    """
+    from integrations.fair_client import FairClient
+    client = FairClient()
+    return {
+        "available": client.is_available(),
+        "api_url": client.api_url,
+        "client_id": client.client_id,
+    }
+
+
 def main() -> None:
     """Entry point for the `cip-mcp` console script. Runs stdio transport."""
     mcp.run()
