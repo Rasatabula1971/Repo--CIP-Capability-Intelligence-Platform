@@ -178,6 +178,14 @@ class TestExtractRequirements:
         assert "error" in result
         assert result["requirements"] == []
 
+    def test_valid_json_but_not_object(self):
+        # LLM returns a bare array instead of an object — must not crash.
+        client = _mock_client(_make_response(output='[{"text": "req1"}]'))
+        result = extract_requirements(client, "PDR text")
+
+        assert "error" in result
+        assert result["requirements"] == []
+
     def test_code_fenced_output(self):
         output = '```json\n{"requirements": [{"text": "req1", "priority": "must", "acceptance_criteria": "works", "source_span": {"start": 0, "end": 5, "quote": "req"}}]}\n```'
         client = _mock_client(_make_response(output=output))
@@ -263,6 +271,19 @@ class TestSuggestVerdict:
         assert "error" in result
         assert "ESCALATION_REQUIRED" in result["error"]
 
+    def test_valid_json_but_not_object(self):
+        client = _mock_client(_make_response(output='["ADOPT"]'))
+        result = suggest_verdict(
+            client,
+            req_id="req-6",
+            description="Need something",
+            constraints=[],
+            candidates=[],
+        )
+
+        assert "error" in result
+        assert "verdict" not in result
+
     def test_constraints_formatted(self):
         client = _mock_client(_make_response(
             output='{"verdict": "REJECT", "rationale": "No match", "chosen_capability_version_id": null}',
@@ -345,6 +366,13 @@ class TestAnalyzeSource:
 
     def test_failed(self):
         client = _mock_client(_make_response(status="FAILED", reason_code="TIMEOUT"))
+        result = analyze_source(client, "code", "file.py")
+
+        assert "error" in result
+        assert result["capabilities"] == []
+
+    def test_valid_json_but_not_object(self):
+        client = _mock_client(_make_response(output='["cap1", "cap2"]'))
         result = analyze_source(client, "code", "file.py")
 
         assert "error" in result

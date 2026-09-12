@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from integrations.fair_client import FairClient, FairResponse
+from integrations.fair_client import FairClient
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +196,18 @@ def extract_requirements(
     try:
         parsed = response.output_json()
     except (json.JSONDecodeError, TypeError):
+        parsed = None
+
+    if not isinstance(parsed, dict):
         return {
-            "error": "FAIR returned non-JSON output",
+            "error": "FAIR returned non-object JSON output",
             "fair_request_id": response.request_id,
             "raw_output": response.output,
             "requirements": [],
         }
 
     return {
-        "requirements": parsed.get("requirements", []) if parsed else [],
+        "requirements": parsed.get("requirements", []),
         "fair_request_id": response.request_id,
         "provider_id": response.provider_id,
         "model_id": response.model_id,
@@ -230,7 +233,7 @@ def suggest_verdict(
                 f"(key={c.get('normalized_key', '?')}, "
                 f"version_id={c.get('capability_version_id', '?')}, "
                 f"ecosystem={c.get('ecosystem', '?')})\n"
-                f"   fit_score={c.get('fit_score', 0):.3f}, "
+                f"   fit_score={(c.get('fit_score') or 0):.3f}, "
                 f"blocking_gaps={c.get('blocking_gap_count', '?')}, "
                 f"intrinsic_score={c.get('intrinsic_score', 'n/a')}"
             )
@@ -259,14 +262,14 @@ def suggest_verdict(
     try:
         parsed = response.output_json()
     except (json.JSONDecodeError, TypeError):
+        parsed = None
+
+    if not isinstance(parsed, dict):
         return {
-            "error": "FAIR returned non-JSON output",
+            "error": "FAIR returned non-object JSON output",
             "fair_request_id": response.request_id,
             "raw_output": response.output,
         }
-
-    if parsed is None:
-        return {"error": "Empty response", "fair_request_id": response.request_id}
 
     return {
         "verdict": parsed.get("verdict", "BUILD"),
@@ -306,14 +309,17 @@ def analyze_source(
     try:
         parsed = response.output_json()
     except (json.JSONDecodeError, TypeError):
+        parsed = None
+
+    if not isinstance(parsed, dict):
         return {
-            "error": "FAIR returned non-JSON output",
+            "error": "FAIR returned non-object JSON output",
             "fair_request_id": response.request_id,
             "capabilities": [],
         }
 
     return {
-        "capabilities": parsed.get("capabilities", []) if parsed else [],
+        "capabilities": parsed.get("capabilities", []),
         "fair_request_id": response.request_id,
         "provider_id": response.provider_id,
         "model_id": response.model_id,
