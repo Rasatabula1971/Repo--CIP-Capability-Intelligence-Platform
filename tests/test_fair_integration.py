@@ -4,6 +4,7 @@ Uses mock responses — no live FAIR server needed.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,12 @@ from integrations.fair_pdr import (
     suggest_verdict,
     analyze_source,
 )
+
+
+# These tests never touch Postgres; skip the session-wide migration fixture.
+@pytest.fixture(scope="session", autouse=True)
+def _apply_migrations():
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +56,6 @@ def _mock_client(response: FairResponse) -> FairClient:
     client = MagicMock(spec=FairClient)
     client.solve.return_value = response
     client.is_available.return_value = True
-    client.api_url = "http://127.0.0.1:8000"
     client.client_id = "cip"
     return client
 
@@ -101,33 +107,94 @@ class TestFairResponse:
 # ---------------------------------------------------------------------------
 
 class TestFairClient:
-    def test_default_config(self):
+    def test_default_client_id(self):
         with patch.dict("os.environ", {}, clear=True):
-            client = FairClient()
-            assert client.api_url == "http://127.0.0.1:8000"
-            assert client.client_id == "cip"
+            assert FairClient().client_id == "cip"
 
-    def test_env_config(self):
-        env = {
-            "FAIR_API_URL": "http://fair.example.com:9000",
-            "FAIR_CLIENT_KEY": "test-key",
-            "FAIR_CLIENT_ID": "test-client",
-        }
-        with patch.dict("os.environ", env, clear=True):
-            client = FairClient()
-            assert client.api_url == "http://fair.example.com:9000"
-            assert client.client_key == "test-key"
-            assert client.client_id == "test-client"
+    def test_env_client_id(self):
+        with patch.dict("os.environ", {"FAIR_CLIENT_ID": "test-client"}, clear=True):
+            assert FairClient().client_id == "test-client"
 
-    def test_explicit_config_overrides_env(self):
-        env = {"FAIR_API_URL": "http://env.example.com"}
-        with patch.dict("os.environ", env, clear=True):
-            client = FairClient(api_url="http://explicit.example.com")
-            assert client.api_url == "http://explicit.example.com"
+    def test_explicit_overrides_env(self):
+        with patch.dict("os.environ", {"FAIR_CLIENT_ID": "env"}, clear=True):
+            assert FairClient(client_id="explicit").client_id == "explicit"
 
-    def test_trailing_slash_stripped(self):
-        client = FairClient(api_url="http://example.com/")
-        assert client.api_url == "http://example.com"
+    def test_unavailable_without_providers(self):
+        # Must report cleanly whether fair is missing or just has no keys.
+        with patch.dict("os.environ", {}, clear=True):
+            status = FairClient().status()
+        assert status["available"] is False
+        assert status["providers"] == []
+        assert status["error"]
+
+
+try:
+    import fair as _fair  # noqa: F401
+    _HAS_FAIR = True
+except ImportError:
+    _HAS_FAIR = False
+
+
+@pytest.mark.skipif(not _HAS_FAIR, reason="fair-free-ai-router not installed")
+class TestFairClientRoundTrip:
+    """Drive the real FairClient through FAIR's offline MockAdapter."""
+
+    def _client(self, text: str) -> FairClient:
+        from fair.providers.mock import MockAdapter
+        from fair.schemas.domain import ProviderSpec
+
+        spec = ProviderSpec(
+            provider_id="mock",
+            access_class="FREE_LOCAL",
+            status="ACTIVE",
+            current_access_cost_usd=0,
+            requires_paid_subscription=False,
+            requires_credit_purchase=False,
+            auto_billing_required=False,
+            programmatic_access=True,
+            production_eligibility=True,
+            models=[{
+                "model_id": "mock-model",
+                "context_window": 32768,
+                "capabilities": {"reasoning", "coding", "structured_output"},
+            }],
+        )
+        return FairClient(providers=[(spec, MockAdapter("mock", text=text))])
+
+    def test_status_lists_providers(self):
+        with patch.dict("os.environ", {}, clear=True):
+            status = self._client("x").status()
+        assert status["available"] is True
+        assert status["error"] is None
+        assert status["providers"][0]["provider_id"] == "mock"
+        assert "mock-model" in status["providers"][0]["models"]
+
+    def test_solve_maps_response(self):
+        with patch.dict("os.environ", {}, clear=True):
+            r = self._client('{"requirements": []}').solve(
+                "extract", task_type="extraction",
+                expected_schema={"type": "object"},
+            )
+        assert isinstance(r, FairResponse)
+        assert r.request_id
+        assert r.status in {"ACCEPTED", "ESCALATION_REQUIRED", "FAILED"}
+        assert r.reason_code
+        assert r.raw["request_id"] == r.request_id
+        assert len(r.attempts) >= 1
+        assert r.attempts[0]["provider_id"] == "mock"
+        assert r.attempts[0]["model_id"] == "mock-model"
+
+    def test_solve_inside_running_loop(self):
+        # The FastMCP path: a sync tool invoked on the event-loop thread.
+        with patch.dict("os.environ", {}, clear=True):
+            client = self._client("hello")
+
+            async def go():
+                return client.solve("say hi")
+
+            r = asyncio.run(go())
+        assert isinstance(r, FairResponse)
+        assert r.request_id
 
 
 # ---------------------------------------------------------------------------

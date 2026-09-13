@@ -1231,8 +1231,8 @@ def fair_extract_requirements(
     """
     Use FAIR (free AI inference) to extract requirements from PDR text.
 
-    Sends the PDR to FAIR's /v1/solve endpoint which routes through
-    free models (Groq, OpenRouter free, Ollama) to extract structured
+    Sends the PDR to the embedded FAIR router, which routes through
+    free models (Gemini, Groq, OpenRouter free, Ollama) to extract structured
     requirements ready for record_requirements.
 
     Args:
@@ -1306,17 +1306,14 @@ def fair_analyze_source(
 @mcp.tool()
 def fair_status() -> dict[str, Any]:
     """
-    Check whether FAIR is reachable and configured.
+    Check whether FAIR is installed and has at least one provider configured.
 
-    Returns {available, api_url, client_id}.
+    Returns {available, client_id, providers[], error}. Each provider has
+    {provider_id, status, access_class, models[]}. error explains why
+    available is False (package missing, no provider keys, ...).
     """
     from integrations.fair_client import FairClient
-    client = FairClient()
-    return {
-        "available": client.is_available(),
-        "api_url": client.api_url,
-        "client_id": client.client_id,
-    }
+    return FairClient().status()
 
 
 # -----------------------------------------------------------------------
