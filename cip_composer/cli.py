@@ -927,16 +927,16 @@ def cmd_fair_analyze(args) -> int:
 
 def cmd_fair_status(args) -> int:
     from integrations.fair_client import FairClient
-    client = FairClient()
-    available = client.is_available()
+    status = FairClient().status()
     if args.json:
-        _print_json({"available": available, "api_url": client.api_url,
-                      "client_id": client.client_id})
+        _print_json(status)
     else:
-        status = "ONLINE" if available else "OFFLINE"
-        print(f"FAIR: {status}")
-        print(f"  URL: {client.api_url}")
-        print(f"  Client: {client.client_id}")
+        print(f"FAIR: {'ONLINE' if status['available'] else 'OFFLINE'}")
+        print(f"  Client: {status['client_id']}")
+        if status["error"]:
+            print(f"  Reason: {status['error']}")
+        for p in status["providers"]:
+            print(f"  {p['provider_id']}: {p['status']} ({', '.join(p['models'])})")
     return 0
 
 

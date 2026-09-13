@@ -26,9 +26,10 @@ Repo--CIP-Capability-Intelligence-Platform/
 │   ├── score/           Deterministic per-kind scoring worker (Phase 3d)
 │   ├── compose/         suggest_pipeline + scaffold_pipeline (Phase 5)
 │   └── bootstrap.py     One-command DB setup (create + migrate)
+├── integrations/        FAIR Free AI Router client + PDR analysis
 ├── plugins/cip-composer/ Claude plugin (skill + MCP server bundle)
-├── db/migrations/       18 SQL migrations, applied in order, checksum-tracked
-├── tests/               512 tests, pytest
+├── db/migrations/       29 SQL migrations, applied in order, checksum-tracked
+├── tests/               pytest
 └── docs/                This file, cadence doc, install doc, WHAT_IS_CIP
 ```
 
@@ -200,6 +201,44 @@ FastMCP-based stdio server (`cip-mcp` console script). Seven tools:
 
 `mcp_server/queries.py` holds every pure DB-query function (no MCP
 types), independently testable.
+
+## FAIR integration (`integrations/`)
+
+Routes CIP's AI-powered analysis through free, quality-verified models
+via the [FAIR Free AI Router](https://github.com/Rasatabula1971/FAIR-Free-AI-Router),
+an embeddable async Python module (no server). Optional extra:
+`pip install "cip[fair]"` (needs Python 3.12+). When FAIR is missing or
+has no provider keys, these tools report the reason but never block the
+rest of CIP.
+
+- `integrations/fair_client.py` — `FairClient` wraps `fair.FAIR.solve()`
+  behind a sync API and maps `SolveResponse` onto `FairResponse`. Builds
+  a fresh `FAIR` per call (its httpx clients are event-loop-bound) and
+  hops to a worker thread when invoked from inside a running loop, which
+  is how FastMCP calls sync tools. Provider keys come from
+  `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` /
+  `OLLAMA_ENABLED`; `FAIR_CLIENT_ID` tags requests (default `cip`).
+  Output budget is capped at 4096 tokens because the Groq, OpenRouter
+  and Ollama adapters reject anything larger.
+- `integrations/fair_pdr.py` — three driver functions using
+  structured JSON schemas:
+  - `extract_requirements()` — PDR text → structured requirements
+  - `suggest_verdict()` — requirement + candidates → ADOPT/ADAPT/…/BUILD
+  - `analyze_source()` — source code → capability metadata
+
+FAIR only returns an answer it can verify. All three drivers send
+schema-only requests, which FAIR accepts at `standard` quality via its
+schema-validated tier — but FAIR's task profiler still escalates any
+task whose text mentions code (`code`, `python`, `.py`, code fences:
+needs a code contract) or grounding (`current`, `latest`, `sources`,
+`research`: needs a grounding contract). In practice `analyze_source()`
+always escalates, and `extract_requirements()` does whenever the PDR
+uses those words.
+
+Exposed as four MCP tools (`fair_extract_requirements`,
+`fair_suggest_verdict`, `fair_analyze_source`, `fair_status`) and
+four CLI commands (`fair-extract`, `fair-suggest-verdict`,
+`fair-analyze`, `fair-status`).
 
 ## CLI (`cip_composer/cli.py`)
 
