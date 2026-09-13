@@ -32,7 +32,21 @@ CREATE TABLE IF NOT EXISTS schema_migration (
 
 
 def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    # Line-ending-normalized hash. Recorded for new applies so a CRLF/LF
+    # flip (e.g. git core.autocrlf on Windows) doesn't later invalidate
+    # an applied migration.
+    raw = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _checksum_matches(path: Path, stored: str) -> bool:
+    # Accept either the normalized hash (new records, LF-based) or the raw
+    # byte hash (older records applied before normalization, which may be
+    # CRLF on Windows). Both differ only on line endings; a genuine content
+    # edit changes both and is still rejected.
+    raw_bytes = path.read_bytes()
+    raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+    return stored == _checksum(path) or stored == raw_hash
 
 
 def _list_migrations() -> list[Path]:
@@ -57,7 +71,7 @@ def up(for_tests: bool = False) -> None:
             fname = path.name
             checksum = _checksum(path)
             if fname in applied:
-                if applied[fname] != checksum:
+                if not _checksum_matches(path, applied[fname]):
                     raise RuntimeError(
                         f"Migration {fname} was applied with a different "
                         f"checksum. Migrations are append-only — never edit "

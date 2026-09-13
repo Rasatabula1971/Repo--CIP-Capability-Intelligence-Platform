@@ -942,6 +942,10 @@ def cmd_fair_status(args) -> int:
 
 def cmd_eval_record(args) -> int:
     payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    missing = [k for k in ("asset_slug", "verdict") if not payload.get(k)]
+    if missing:
+        print(f"Error: JSON is missing required field(s): {', '.join(missing)}")
+        return 1
     conn = connect()
     try:
         result = eval_queries.record_evaluation(
