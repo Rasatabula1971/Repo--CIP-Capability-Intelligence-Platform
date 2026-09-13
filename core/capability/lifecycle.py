@@ -1,31 +1,35 @@
 """
-Capability lifecycle — Step 11.
+Capability lifecycle — Step 11 + Phase 1 license enforcement.
 
-Two responsibilities:
+Responsibilities:
   1. `check_publication_guards()` — returns a list of GuardFailure. One
      entry per guard that isn't satisfied. Empty list means the
      capability_version is publishable.
-  2. `advance_to()` — attempts a state transition, using the Step 3
-     workflow engine so the transition is audited (state_transition
-     row) and events flow through the outbox.
+  2. `advance_to()` — attempts a forward state transition, using the
+     Step 3 workflow engine so the transition is audited.
+  3. `block_from_reuse()` / `mark_needs_review()` — lateral transitions
+     for license failures and ambiguities.
 
-Guards (in the order they're checked):
-  1. current_revision      — no newer snapshotted revision exists for
-                              the same source_asset
+Lifecycle (Phase 1):
+  CANDIDATE → LICENSE_CHECKED → ANALYZED → VERIFIED → CATALOGED
+
+  Lateral (from any pre-CATALOGED state):
+    → BLOCKED_FROM_REUSE   (license gate hard-fail)
+    → NEEDS_REVIEW         (ambiguous license, human decision needed)
+
+  Terminal / external:
+    → STALE / QUARANTINED / DEPRECATED / REVOKED
+
+Guards (in the order they're checked for CATALOGED):
+  1. current_revision      — no newer snapshotted revision exists
   2. required_scorecard    — at least one scorecard row exists
   3. confidence_threshold  — scorecard.confidence >= CONFIDENCE_THRESHOLD
-  4. no_blocking_gate      — workers.gates.can_publish() allowed=True
-                              (delegates the "gates evaluated + all
-                              acceptable" question)
+  4. no_blocking_gate      — all blocking gates pass
   5. source_binding        — at least one capability_source_binding row
   6. summary               — summary text is non-empty
   7. interfaces            — at least one capability_interface row
 
-Each guard is a separate check function so tests can fail one at a time
-and assert the exact reason.
-
-CONFIDENCE_THRESHOLD is hardcoded for MVP. Bumping it later is a Step
-15+ tuning knob (a scoring-profile-level setting).
+CONFIDENCE_THRESHOLD is hardcoded for MVP.
 """
 from __future__ import annotations
 
@@ -45,23 +49,28 @@ CONFIDENCE_THRESHOLD = 0.6      # MVP tuning knob
 # ---------------------------------------------------------------------------
 
 class LifecycleState(str, Enum):
-    CANDIDATE   = "candidate"
-    ANALYZED    = "analyzed"
-    VERIFIED    = "verified"
-    CATALOGED   = "cataloged"
-    STALE       = "stale"
-    QUARANTINED = "quarantined"
-    DEPRECATED  = "deprecated"
-    REVOKED     = "revoked"
+    CANDIDATE          = "candidate"
+    LICENSE_CHECKED    = "license_checked"
+    ANALYZED           = "analyzed"
+    VERIFIED           = "verified"
+    CATALOGED          = "cataloged"
+    STALE              = "stale"
+    QUARANTINED        = "quarantined"
+    DEPRECATED         = "deprecated"
+    REVOKED            = "revoked"
+    BLOCKED_FROM_REUSE = "blocked_from_reuse"
+    NEEDS_REVIEW       = "needs_review"
 
 
-# Allowed forward transitions. Other transitions (stale/quarantined/
-# deprecated/revoked) are set explicitly by other workflows, not via
-# advance_to().
+# Allowed forward transitions. License check is now required before
+# analysis. Other transitions (stale/quarantined/deprecated/revoked/
+# blocked_from_reuse/needs_review) are set explicitly by other
+# workflows, not via advance_to().
 _FORWARD_TRANSITIONS = {
-    LifecycleState.CANDIDATE: LifecycleState.ANALYZED,
-    LifecycleState.ANALYZED:  LifecycleState.VERIFIED,
-    LifecycleState.VERIFIED:  LifecycleState.CATALOGED,
+    LifecycleState.CANDIDATE:       LifecycleState.LICENSE_CHECKED,
+    LifecycleState.LICENSE_CHECKED: LifecycleState.ANALYZED,
+    LifecycleState.ANALYZED:        LifecycleState.VERIFIED,
+    LifecycleState.VERIFIED:        LifecycleState.CATALOGED,
 }
 
 
@@ -284,6 +293,63 @@ def guard_interfaces(
     return None
 
 
+def guard_license_checked(
+    conn, cap_version_id: uuid.UUID
+) -> GuardFailure | None:
+    """
+    The capability must have a non-blocked license_status before it can
+    advance to LICENSE_CHECKED. This gate reads the parent capability's
+    license_status (set by the license classifier).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.license_status, c.license_spdx
+            FROM capability_version cv
+            JOIN capability c ON c.id = cv.capability_id
+            WHERE cv.id = %s
+            """,
+            (str(cap_version_id),),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return GuardFailure(
+            guard_name="license_checked",
+            reason="capability_version not found",
+            detail={},
+        )
+
+    license_status, license_spdx = row
+
+    if license_status == "blocked":
+        return GuardFailure(
+            guard_name="license_checked",
+            reason=(
+                f"license is blocked ({license_spdx or 'no license'}); "
+                f"cannot proceed to analysis"
+            ),
+            detail={
+                "license_status": license_status,
+                "license_spdx": license_spdx,
+            },
+        )
+
+    if license_status == "unknown":
+        return GuardFailure(
+            guard_name="license_checked",
+            reason="license has not been evaluated yet",
+            detail={
+                "license_status": license_status,
+                "license_spdx": license_spdx,
+            },
+        )
+
+    # verified_open_source and needs_review both pass (needs_review
+    # can still proceed with human acknowledgment).
+    return None
+
+
 # The seven guards in the order they're evaluated.
 PUBLICATION_GUARDS: list[
     Callable[[psycopg.Connection, uuid.UUID], GuardFailure | None]
@@ -374,6 +440,13 @@ def advance_to(
             f"expected {expected_from.value!r}"
         )
 
+    # For LICENSE_CHECKED, verify the license has been classified
+    # and is not blocked.
+    if target == LifecycleState.LICENSE_CHECKED:
+        failure = guard_license_checked(conn, capability_version_id)
+        if failure is not None:
+            raise GuardsFailed([failure])
+
     # For CATALOGED, all seven guards must pass.
     if target == LifecycleState.CATALOGED:
         failures = check_publication_guards(
@@ -418,3 +491,144 @@ def _predecessor_of(target: LifecycleState) -> LifecycleState | None:
         if dst == target:
             return src
     return None
+
+
+# States that can transition laterally to blocked/needs_review.
+_BLOCKABLE_STATES = frozenset({
+    LifecycleState.CANDIDATE,
+    LifecycleState.LICENSE_CHECKED,
+    LifecycleState.ANALYZED,
+    LifecycleState.VERIFIED,
+})
+
+
+def block_from_reuse(
+    conn,
+    *,
+    capability_version_id: uuid.UUID,
+    reason: str,
+    actor: str = "system:license",
+) -> AdvanceOutcome:
+    """
+    Lateral transition: move a capability_version to BLOCKED_FROM_REUSE.
+    This is a terminal state for the reuse pipeline — the component
+    cannot be selected or recommended.
+
+    Only allowed from pre-CATALOGED states.
+    """
+    from core.workflow.engine import OutboxEvent, attempt_transition
+
+    current = current_state(conn, capability_version_id)
+    if current == LifecycleState.BLOCKED_FROM_REUSE:
+        return AdvanceOutcome(
+            capability_version_id=capability_version_id,
+            previous_state=current.value,
+            new_state=LifecycleState.BLOCKED_FROM_REUSE.value,
+            was_noop=True,
+        )
+    if current not in _BLOCKABLE_STATES:
+        raise IllegalTransition(
+            f"cannot block from {current.value!r}; "
+            f"only pre-cataloged states can be blocked"
+        )
+
+    attempt_transition(
+        conn,
+        entity_kind="capability_version",
+        entity_id=capability_version_id,
+        from_state=current.value,
+        to_state=LifecycleState.BLOCKED_FROM_REUSE.value,
+        entity_update_sql=(
+            "UPDATE capability_version SET lifecycle_state = %s "
+            "WHERE id = %s AND lifecycle_state = %s"
+        ),
+        entity_update_params=(
+            LifecycleState.BLOCKED_FROM_REUSE.value,
+            str(capability_version_id),
+            current.value,
+        ),
+        actor=actor,
+        reason=reason,
+        events=[OutboxEvent(
+            aggregate_kind="capability_version",
+            aggregate_id=capability_version_id,
+            event_type="capability_version.blocked_from_reuse",
+            payload={
+                "capability_version_id": str(capability_version_id),
+                "reason": reason,
+            },
+        )],
+    )
+
+    return AdvanceOutcome(
+        capability_version_id=capability_version_id,
+        previous_state=current.value,
+        new_state=LifecycleState.BLOCKED_FROM_REUSE.value,
+        was_noop=False,
+    )
+
+
+def mark_needs_review(
+    conn,
+    *,
+    capability_version_id: uuid.UUID,
+    reason: str,
+    actor: str = "system:license",
+) -> AdvanceOutcome:
+    """
+    Lateral transition: move to NEEDS_REVIEW when the license is
+    ambiguous (dual-license, custom text, source-available). A human
+    must decide before the component can proceed.
+
+    Only allowed from pre-CATALOGED states.
+    """
+    from core.workflow.engine import OutboxEvent, attempt_transition
+
+    current = current_state(conn, capability_version_id)
+    if current == LifecycleState.NEEDS_REVIEW:
+        return AdvanceOutcome(
+            capability_version_id=capability_version_id,
+            previous_state=current.value,
+            new_state=LifecycleState.NEEDS_REVIEW.value,
+            was_noop=True,
+        )
+    if current not in _BLOCKABLE_STATES:
+        raise IllegalTransition(
+            f"cannot mark needs_review from {current.value!r}; "
+            f"only pre-cataloged states can be marked for review"
+        )
+
+    attempt_transition(
+        conn,
+        entity_kind="capability_version",
+        entity_id=capability_version_id,
+        from_state=current.value,
+        to_state=LifecycleState.NEEDS_REVIEW.value,
+        entity_update_sql=(
+            "UPDATE capability_version SET lifecycle_state = %s "
+            "WHERE id = %s AND lifecycle_state = %s"
+        ),
+        entity_update_params=(
+            LifecycleState.NEEDS_REVIEW.value,
+            str(capability_version_id),
+            current.value,
+        ),
+        actor=actor,
+        reason=reason,
+        events=[OutboxEvent(
+            aggregate_kind="capability_version",
+            aggregate_id=capability_version_id,
+            event_type="capability_version.needs_review",
+            payload={
+                "capability_version_id": str(capability_version_id),
+                "reason": reason,
+            },
+        )],
+    )
+
+    return AdvanceOutcome(
+        capability_version_id=capability_version_id,
+        previous_state=current.value,
+        new_state=LifecycleState.NEEDS_REVIEW.value,
+        was_noop=False,
+    )

@@ -1,0 +1,4 @@
+# Keep SQL migrations LF so their checksums stay stable across platforms.
+# Migration checksums are recorded LF-based; a CRLF flip would otherwise
+# invalidate already-applied migrations.
+*.sql text eol=lf

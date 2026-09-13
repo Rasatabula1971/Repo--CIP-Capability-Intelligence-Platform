@@ -30,11 +30,7 @@ from analysis.evidence import (
     SourceFile,
     validate_locator_or_raise,
 )
-from analysis.extractors.interfaces import InterfaceExtractor
-from analysis.extractors.licenses import LicenseExtractor
-from analysis.extractors.manifests import ManifestExtractor
-from analysis.extractors.secrets import SecretIndicatorExtractor
-from analysis.extractors.tests import TestPresenceExtractor
+from analysis.extractors import all_extractors
 from connectors.base import (
     AssetRef,
     ConnectorRegistry,
@@ -49,18 +45,12 @@ from connectors.base import (
 # Bump this when the set of extractors or their outputs changes materially.
 # The no-op short-circuit keys on (content_hash, config_version) — if a
 # prior run at the same content but older version exists, we still re-run.
-EXTRACTOR_CONFIG_VERSION = 1
+EXTRACTOR_CONFIG_VERSION = 2
 
 
 def default_extractors() -> list:
-    """The stock lineup. Callers can pass a different list for tests."""
-    return [
-        ManifestExtractor(),
-        InterfaceExtractor(),
-        TestPresenceExtractor(),
-        LicenseExtractor(),
-        SecretIndicatorExtractor(),
-    ]
+    """Auto-discovered from analysis.extractors package."""
+    return all_extractors()
 
 
 # ---------------------------------------------------------------------------

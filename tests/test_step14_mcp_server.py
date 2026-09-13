@@ -86,12 +86,15 @@ def _mk_capability(
     display_name: str,
     ecosystem: str | None = "pypi",
     kind: str = "library",
+    metadata: dict | None = None,
 ) -> uuid.UUID:
+    import json as _json
+    meta = _json.dumps(metadata or {})
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO capability (normalized_key, display_name, ecosystem, kind) "
-            "VALUES (%s, %s, %s, %s) RETURNING id",
-            (normalized_key, display_name, ecosystem, kind),
+            "INSERT INTO capability (normalized_key, display_name, ecosystem, kind, metadata) "
+            "VALUES (%s, %s, %s, %s, %s::jsonb) RETURNING id",
+            (normalized_key, display_name, ecosystem, kind, meta),
         )
         return cur.fetchone()[0]
 
@@ -339,3 +342,129 @@ def test_detail_includes_scorecard_with_dimensions_when_present(conn):
     assert dim["name"] == "health"
     assert dim["raw_score"] == pytest.approx(0.8)
     assert dim["evidence_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 0.5 — search quality upgrade tests
+# ---------------------------------------------------------------------------
+
+def test_search_returns_text_relevance_field(conn):
+    """Upgraded search includes a text_relevance score in results."""
+    _mk_capability(conn, "pypi:requests", "requests")
+    conn.commit()
+
+    rows = queries.search_capabilities(conn, query="requests")
+    assert len(rows) == 1
+    assert "text_relevance" in rows[0]
+    assert isinstance(rows[0]["text_relevance"], (int, float))
+    assert rows[0]["text_relevance"] > 0
+
+
+def test_search_exact_match_ranks_higher_than_substring(conn):
+    """An exact name match should score higher than a partial match."""
+    _mk_capability(conn, "pypi:click", "click")
+    _mk_capability(conn, "pypi:clicker-tool", "clicker-tool")
+    conn.commit()
+
+    rows = queries.search_capabilities(conn, query="click")
+    assert len(rows) >= 2
+    rel_exact = next(r["text_relevance"] for r in rows if r["normalized_key"] == "pypi:click")
+    rel_sub = next(r["text_relevance"] for r in rows if r["normalized_key"] == "pypi:clicker-tool")
+    assert rel_exact >= rel_sub
+
+
+def test_search_filter_by_single_tag(conn):
+    """The tags parameter filters to rows whose metadata.topics contain the tag."""
+    _mk_capability(conn, "pypi:opencv", "OpenCV",
+                   metadata={"topics": ["video", "ai", "python"]})
+    _mk_capability(conn, "pypi:pillow", "Pillow",
+                   metadata={"topics": ["image", "python"]})
+    conn.commit()
+
+    rows = queries.search_capabilities(conn, query="p", tags=["video"])
+    keys = [r["normalized_key"] for r in rows]
+    assert "pypi:opencv" in keys
+    assert "pypi:pillow" not in keys
+
+
+def test_search_filter_by_multiple_tags_requires_all(conn):
+    """Multiple tags use AND — the row must contain every tag."""
+    _mk_capability(conn, "pypi:torch", "PyTorch",
+                   metadata={"topics": ["ai", "gpu", "python"]})
+    _mk_capability(conn, "pypi:numpy", "NumPy",
+                   metadata={"topics": ["math", "python"]})
+    _mk_capability(conn, "pypi:jax", "JAX",
+                   metadata={"topics": ["ai", "python"]})
+    conn.commit()
+
+    rows = queries.search_capabilities(conn, query="p", tags=["ai", "gpu"])
+    keys = [r["normalized_key"] for r in rows]
+    assert "pypi:torch" in keys
+    assert "pypi:numpy" not in keys
+    assert "pypi:jax" not in keys
+
+
+def test_search_tags_empty_list_returns_all(conn):
+    """An empty tags list has no filtering effect."""
+    _mk_capability(conn, "pypi:foo", "foo",
+                   metadata={"topics": ["web"]})
+    _mk_capability(conn, "pypi:bar", "bar",
+                   metadata={"topics": ["cli"]})
+    conn.commit()
+
+    rows_no_tags = queries.search_capabilities(conn, query="")
+    rows_empty = queries.search_capabilities(conn, query="foo", tags=[])
+    # Empty tags list should behave like no tags param
+    assert len(rows_empty) == len(
+        queries.search_capabilities(conn, query="foo", tags=None)
+    )
+
+
+def test_search_tags_with_no_topics_in_metadata(conn):
+    """Rows with no topics key in metadata are excluded by tag filter."""
+    _mk_capability(conn, "pypi:bare", "bare")  # no metadata.topics
+    _mk_capability(conn, "pypi:tagged", "tagged",
+                   metadata={"topics": ["web"]})
+    conn.commit()
+
+    rows = queries.search_capabilities(conn, query="b", tags=["web"])
+    keys = [r["normalized_key"] for r in rows]
+    assert "pypi:bare" not in keys
+
+
+def test_search_composite_ranking_weighs_score(conn):
+    """Higher intrinsic score should boost ranking when text relevance is similar."""
+    cap_a = _mk_capability(conn, "pypi:flask-a", "flask-a")
+    cap_b = _mk_capability(conn, "pypi:flask-b", "flask-b")
+    ver_a = _mk_version(conn, cap_a)
+    ver_b = _mk_version(conn, cap_b)
+    profile = _mk_scoring_profile(conn)
+    _mk_scorecard(conn, ver_a, profile, total=0.20)
+    _mk_scorecard(conn, ver_b, profile, total=0.95)
+    conn.commit()
+
+    rows = queries.search_capabilities(conn, query="flask")
+    keys = [r["normalized_key"] for r in rows]
+    assert keys.index("pypi:flask-b") < keys.index("pypi:flask-a")
+
+
+def test_search_combines_tags_with_other_filters(conn):
+    """Tags work alongside ecosystem and kind filters."""
+    _mk_capability(conn, "pypi:web-py", "web-py", ecosystem="pypi", kind="library",
+                   metadata={"topics": ["web"]})
+    _mk_capability(conn, "npm:web-js", "web-js", ecosystem="npm", kind="library",
+                   metadata={"topics": ["web"]})
+    conn.commit()
+
+    rows = queries.search_capabilities(
+        conn, query="web", ecosystem="pypi", tags=["web"],
+    )
+    keys = [r["normalized_key"] for r in rows]
+    assert "pypi:web-py" in keys
+    assert "npm:web-js" not in keys
+
+
+def test_has_pg_trgm_helper(conn):
+    """_has_pg_trgm returns a bool and doesn't crash."""
+    result = queries._has_pg_trgm(conn)
+    assert isinstance(result, bool)

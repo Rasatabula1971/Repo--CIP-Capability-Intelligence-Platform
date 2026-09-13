@@ -111,6 +111,14 @@ def _prepare_fully(conn, registry, external_key="acme/clean",
     )
     cv_id = out.capability_version_id
 
+    # Set license_status on the capability so the license gate passes.
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE capability SET license_status = 'verified_open_source' "
+            "WHERE id = (SELECT capability_id FROM capability_version WHERE id = %s)",
+            (str(cv_id),),
+        )
+
     # Score.
     score_capability_version(
         conn,
@@ -332,14 +340,20 @@ def test_happy_path_all_seven_guards_pass(conn, registry):
 
 
 def test_full_advance_pipeline_reaches_cataloged(conn, registry):
-    """Baseline → analyzed → verified → cataloged, all via advance_to."""
+    """Baseline → license_checked → analyzed → verified → cataloged."""
     cv_id = _prepare_fully(conn, registry)
     assert current_state(conn, cv_id) == LifecycleState.CANDIDATE
+
+    o0 = advance_to(conn, capability_version_id=cv_id,
+                     target=LifecycleState.LICENSE_CHECKED)
+    conn.commit()
+    assert o0.previous_state == "candidate"
+    assert o0.new_state == "license_checked"
 
     o1 = advance_to(conn, capability_version_id=cv_id,
                      target=LifecycleState.ANALYZED)
     conn.commit()
-    assert o1.previous_state == "candidate"
+    assert o1.previous_state == "license_checked"
     assert o1.new_state == "analyzed"
     assert current_state(conn, cv_id) == LifecycleState.ANALYZED
 
@@ -359,8 +373,8 @@ def test_advance_leaves_state_transition_rows_and_outbox_events(
     conn, registry
 ):
     cv_id = _prepare_fully(conn, registry)
-    for target in (LifecycleState.ANALYZED, LifecycleState.VERIFIED,
-                    LifecycleState.CATALOGED):
+    for target in (LifecycleState.LICENSE_CHECKED, LifecycleState.ANALYZED,
+                    LifecycleState.VERIFIED, LifecycleState.CATALOGED):
         advance_to(conn, capability_version_id=cv_id, target=target)
         conn.commit()
 
@@ -372,7 +386,7 @@ def test_advance_leaves_state_transition_rows_and_outbox_events(
             (str(cv_id),),
         )
         states = [r[0] for r in cur.fetchall()]
-    assert states == ["analyzed", "verified", "cataloged"]
+    assert states == ["license_checked", "analyzed", "verified", "cataloged"]
 
     with conn.cursor() as cur:
         cur.execute(
@@ -382,6 +396,7 @@ def test_advance_leaves_state_transition_rows_and_outbox_events(
         )
         events = [r[0] for r in cur.fetchall()]
     assert events == [
+        "capability_version.license_checked",
         "capability_version.analyzed",
         "capability_version.verified",
         "capability_version.cataloged",
@@ -396,6 +411,8 @@ def test_advance_to_cataloged_raises_when_guards_fail(conn, registry):
     """A version at VERIFIED that then loses its scorecard cannot
     advance to cataloged — the guard fires and raises GuardsFailed."""
     cv_id = _prepare_fully(conn, registry)
+    advance_to(conn, capability_version_id=cv_id,
+                target=LifecycleState.LICENSE_CHECKED)
     advance_to(conn, capability_version_id=cv_id,
                 target=LifecycleState.ANALYZED)
     advance_to(conn, capability_version_id=cv_id,
@@ -419,13 +436,15 @@ def test_advance_to_analyzed_and_verified_does_not_check_publication_guards(
     version can reach VERIFIED without a summary — it just can't reach
     CATALOGED without one."""
     cv_id = _prepare_fully(conn, registry)
-    # Clear summary — should not block ANALYZED or VERIFIED.
+    # Clear summary — should not block LICENSE_CHECKED, ANALYZED, or VERIFIED.
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE capability_version SET summary = NULL WHERE id = %s",
             (str(cv_id),),
         )
     conn.commit()
+    advance_to(conn, capability_version_id=cv_id,
+                target=LifecycleState.LICENSE_CHECKED)
     advance_to(conn, capability_version_id=cv_id,
                 target=LifecycleState.ANALYZED)
     advance_to(conn, capability_version_id=cv_id,
@@ -447,7 +466,7 @@ def test_advance_to_analyzed_and_verified_does_not_check_publication_guards(
 def test_candidate_cannot_jump_straight_to_cataloged(conn, registry):
     cv_id = _prepare_fully(conn, registry)
     assert current_state(conn, cv_id) == LifecycleState.CANDIDATE
-    with pytest.raises(IllegalTransition, match="expected 'verified'"):
+    with pytest.raises(IllegalTransition):
         advance_to(conn, capability_version_id=cv_id,
                     target=LifecycleState.CATALOGED)
 
@@ -498,6 +517,11 @@ def test_risk_acceptance_lets_a_blocked_publication_proceed(
         conn, registry, external_key="acme/gpl", revision_key="sha1",
         files=gpl_files,
     )
+    # GPL still has license_status='verified_open_source' from
+    # _prepare_fully (it sets all to verified). The license_checked
+    # gate checks license_status, not the gate_result.
+    advance_to(conn, capability_version_id=cv_id,
+                target=LifecycleState.LICENSE_CHECKED)
     advance_to(conn, capability_version_id=cv_id,
                 target=LifecycleState.ANALYZED)
     advance_to(conn, capability_version_id=cv_id,

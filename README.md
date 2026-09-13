@@ -1,5 +1,33 @@
 # Capability Intelligence Platform
 
+## How It Works (Plain English)
+
+CIP is a **librarian for code**. When you're building software, you constantly need to answer questions like "is there already something that does this?", "what functions does this library give me?", "will this package work with my project's rules?", and "this thing broke — what can I replace it with?" CIP answers all of those by scanning codebases, cataloguing what it finds, and letting you search through it.
+
+### Scanning
+
+You point CIP at a directory of code. It reads every file — Python, TypeScript, JavaScript, whatever — and runs a set of "extractors" over them. Think of extractors as specialists: one finds package manifests (setup.py, package.json) to learn what the project is and what it depends on; one finds exported functions, classes, and interfaces — the public API of the code; one classifies each symbol by role (is this a React component? A middleware? A utility function? An API endpoint?); others check for licenses, test coverage, and secrets accidentally left in the code.
+
+### Cataloguing
+
+Everything the extractors find gets stored in a registry (a database). Each piece of code becomes a searchable "capability" with metadata: what language it's in, what it costs, what license it uses, what it depends on.
+
+### Querying
+
+When you need something, you search the registry. You can search by keyword, filter by language or role, or ask higher-level questions like "will this library conflict with that one?" or "does this fit my project's constraints?"
+
+### Using It When Developing Other Apps
+
+- **"What's available?"** — Before writing anything new, run `cip-composer analyze-local ./my-codebase`. It scans your existing code and tells you what's already there — utility functions, data models, API endpoints, etc. This prevents you from reinventing things you already have.
+- **"I need an HTTP client"** — Search the registry: `cip-composer find "http client" --runtime python_import --cost-tier free`. CIP returns ranked results with license info, health scores, and whether each option fits your project's constraints (maybe you require only MIT-licensed code, or you can't use anything that needs a GPU).
+- **"Will this work with what I have?"** — Before adopting a library, check compatibility: does it conflict with your existing dependencies? Does its license match your policy? Does it need system libraries you don't have? CIP answers all of this without you manually reading docs.
+- **"Something broke"** — A package you depend on releases a breaking change. Tell CIP what failed, and it suggests replacements — ranked by how well they fit your project, how healthy they are, and whether other projects have had good experiences with them.
+- **"Build me a pipeline"** — Describe what you want in plain English: "I need to fetch data from an API, transform it, and store it in a database." CIP decomposes that into stages and suggests a component for each one from the registry, checking that adjacent stages are compatible.
+
+The `analyze-local` command is the simplest entry point: point it at any folder, and in seconds you get a map of everything CIP can see — every function, every interface, every symbol, organized by type and language. No database setup needed, no configuration. Just scan and learn.
+
+---
+
 The specs (Build Workflow, PDR, Data Model, State Machine) are the source of truth; this code is one path through them.
 
 Two layers ship in this repo:
