@@ -1589,8 +1589,14 @@ def fair_extract_requirements(
     Use FAIR (free AI inference) to extract requirements from PDR text.
 
     Sends the PDR to the embedded FAIR router, which routes through
-    free models (Gemini, Groq, OpenRouter free, Ollama) to extract structured
-    requirements ready for record_requirements.
+    free models (Gemini, Groq, OpenRouter free, Ollama) and returns
+    requirement drafts in the shape record_requirements takes: slug, text,
+    priority, kind, a verbatim quote, and a list of acceptance criteria.
+
+    They are drafts from a free model. Writes nothing. Pass them to
+    record_requirements, which locates each quote in the stored PDR and
+    refuses any it cannot find, and read them first: a model can miss a
+    requirement or invent one.
 
     Args:
       pdr_text: the full PDR document text.
@@ -1614,15 +1620,21 @@ def fair_suggest_verdict(
     """
     Use FAIR to suggest a reuse/build verdict for a requirement.
 
-    Sends the requirement and search candidates to FAIR for
-    evaluation. Returns a recommended verdict (ADOPT/ADAPT/WRAP/
-    REFERENCE/REJECT/BUILD) with rationale.
+    Sends the capability need and its search candidates to FAIR for
+    evaluation. Returns a suggested verdict (ADOPT/ADAPT/WRAP/REFERENCE/
+    BUILD) with rationale.
+
+    A suggestion from a free model. Writes nothing and decides nothing.
+    Pass it to record_decision as your proposal: CIP computes its own
+    verdict there, and a proposal that differs is recorded as an override
+    or as LLM judgment and shown to the human at lock time.
 
     Args:
-      req_id: UUID of the project_requirement.
-      description: the requirement description text.
-      constraints: list of constraint dicts from the requirement.
-      candidates: list of candidate dicts from search_for_requirement.
+      req_id: UUID of the capability need.
+      description: the need's description text.
+      constraints: list of constraint dicts from the need.
+      candidates: the `candidates` list from search_for_requirement, as
+        returned (the evidence fields on each candidate are used).
 
     Returns {verdict, rationale, chosen_capability_version_id,
     fair_request_id, ...} or {error}.

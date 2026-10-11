@@ -35,6 +35,8 @@ Used in this order. Full contracts in [`docs/pdr_to_build_spec_v1_1.md`](../docs
 
 There is no tool that records a human approval, and none takes an approver or an approval note. That is done in a terminal with `cip-composer approvals`.
 
+The four `fair_*` tools call a free model and write nothing. `fair_extract_requirements` returns drafts in the shape `record_requirements` takes; `fair_suggest_verdict` returns a suggestion to pass to `record_decision` as a proposal. Both are checked there like anything else the agent proposes.
+
 Older tools on this server that write into what the workflow reads are held to it: `import_requirements` is refused for a project with a PDR, `authorize_build` refuses a capability need, files written by `scaffold_pipeline` are logged (also when it fails halfway) and labelled if one is ingested as a PDR, and `record_evaluation` leaves an audit event when it changes an evaluation.
 
 Document paths (`pdr_path`, `architecture_doc_path`) must be absolute: the server does not run in the project's folder. Only `.md`, `.markdown`, `.txt`, `.rst` and `.text` files are read. `CIP_DOCUMENT_ROOTS` confines reading to listed folders; set it. If it is set and names no folder, nothing is read.

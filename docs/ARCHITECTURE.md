@@ -250,23 +250,37 @@ rest of CIP.
   hops to a worker thread when invoked from inside a running loop, which
   is how FastMCP calls sync tools. Provider keys come from
   `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` /
-  `OLLAMA_ENABLED`; `FAIR_CLIENT_ID` tags requests (default `cip`).
+  `OLLAMA_ENABLED` (and any other provider key FAIR itself reads from the
+  environment); `FAIR_CLIENT_ID` tags requests (default `cip`).
   Output budget is capped at 4096 tokens because the Groq, OpenRouter
   and Ollama adapters reject anything larger.
 - `integrations/fair_pdr.py` — three driver functions using
   structured JSON schemas:
-  - `extract_requirements()` — PDR text → structured requirements
-  - `suggest_verdict()` — requirement + candidates → ADOPT/ADAPT/…/BUILD
+  - `extract_requirements()` — PDR text → requirement drafts in the
+    shape `record_requirements` takes (slug, text, priority, kind, a
+    verbatim quote, a list of acceptance criteria; no offsets)
+  - `suggest_verdict()` — capability need + the candidates a search
+    returned, with their evidence fields → ADOPT / ADAPT / WRAP /
+    REFERENCE / BUILD. REJECT is not offered: it is not an outcome for a
+    need
   - `analyze_source()` — source code → capability metadata
 
+**These tools write nothing and decide nothing.** A draft goes through
+`record_requirements`, which locates every quote in the stored PDR and
+refuses what it cannot find. A suggested verdict goes to
+`record_decision` as the caller's proposal; CIP computes its own verdict
+there and records who decided. `tests/test_fair_pdr_contract.py` holds
+the two ends together: the schema the model fills, and the tools its
+answer is passed to.
+
 FAIR only returns an answer it can verify. All three drivers send
-schema-only requests, which FAIR accepts at `standard` quality via its
-schema-validated tier — but FAIR's task profiler still escalates any
-task whose text mentions code (`code`, `python`, `.py`, code fences:
-needs a code contract) or grounding (`current`, `latest`, `sources`,
-`research`: needs a grounding contract). In practice `analyze_source()`
-always escalates, and `extract_requirements()` does whenever the PDR
-uses those words.
+schema-only requests, which FAIR accepts at `standard` quality through
+its schema-validated tier, and refuses when the answer does not fit the
+schema. Checked against FAIR 0.2.0 (commit `42a970e`) through its
+offline mock provider: all three drivers come back accepted, including
+`analyze_source()` and a PDR that mentions code or "latest sources",
+both of which an earlier FAIR escalated. No live provider was exercised;
+that needs a key.
 
 Exposed as four MCP tools (`fair_extract_requirements`,
 `fair_suggest_verdict`, `fair_analyze_source`, `fair_status`) and

@@ -1570,12 +1570,17 @@ def cmd_fair_extract(args) -> int:
     if args.json:
         _print_json(result)
     else:
+        # Everything below was written by a model. One line per value.
+        v = one_line
         reqs = result.get("requirements", [])
-        print(f"Extracted {len(reqs)} requirements "
-              f"(via {result.get('provider_id', '?')}/{result.get('model_id', '?')})")
+        print(f"Drafted {len(reqs)} requirements "
+              f"(via {v(result.get('provider_id', '?'))}/{v(result.get('model_id', '?'))})")
         for i, r in enumerate(reqs, 1):
-            prio = r.get("priority", "?")
-            print(f"  {i}. [{prio}] {r.get('text', '(no text)')}")
+            if not isinstance(r, dict):
+                continue
+            print(f"  {i}. [{v(r.get('priority', '?'))}] {v(r.get('slug', '?'))}: "
+                  f"{v(r.get('text', '(no text)'))}")
+        print("These are drafts. record_requirements checks every quote against the PDR.")
     return 0
 
 
@@ -1599,10 +1604,13 @@ def cmd_fair_suggest_verdict(args) -> int:
     if args.json:
         _print_json(result)
     else:
-        print(f"Verdict: {result.get('verdict', '?')}")
-        print(f"Rationale: {result.get('rationale', '')}")
+        print(f"Suggested verdict: {one_line(result.get('verdict', '?'))}")
+        print(f"Rationale: {one_line(result.get('rationale', ''))}")
         if result.get("chosen_capability_version_id"):
-            print(f"Chosen: {result['chosen_capability_version_id']}")
+            print(f"Chosen: {one_line(result['chosen_capability_version_id'])}")
+        if result.get("note"):
+            print(f"Note: {one_line(result['note'])}")
+        print("A suggestion from a free model. record_decision computes CIP's own verdict.")
     return 0
 
 
@@ -1622,9 +1630,11 @@ def cmd_fair_analyze(args) -> int:
         print(f"Found {len(caps)} capabilities "
               f"(via {result.get('provider_id', '?')}/{result.get('model_id', '?')})")
         for c in caps:
-            ifaces = len(c.get("interfaces", []))
-            deps = len(c.get("dependencies", []))
-            print(f"  {c.get('name', '?')} ({c.get('kind', '?')}) "
+            if not isinstance(c, dict):
+                continue
+            ifaces = len(c.get("interfaces") or [])
+            deps = len(c.get("dependencies") or [])
+            print(f"  {one_line(c.get('name', '?'))} ({one_line(c.get('kind', '?'))}) "
                   f"— {ifaces} interfaces, {deps} deps")
     return 0
 
@@ -1636,11 +1646,12 @@ def cmd_fair_status(args) -> int:
         _print_json(status)
     else:
         print(f"FAIR: {'ONLINE' if status['available'] else 'OFFLINE'}")
-        print(f"  Client: {status['client_id']}")
+        print(f"  Client: {one_line(status['client_id'])}")
         if status["error"]:
-            print(f"  Reason: {status['error']}")
+            print(f"  Reason: {one_line(status['error'], 400)}")
         for p in status["providers"]:
-            print(f"  {p['provider_id']}: {p['status']} ({', '.join(p['models'])})")
+            models = ", ".join(one_line(m) for m in p.get("models") or [])
+            print(f"  {one_line(p['provider_id'])}: {one_line(p['status'])} ({models})")
     return 0
 
 

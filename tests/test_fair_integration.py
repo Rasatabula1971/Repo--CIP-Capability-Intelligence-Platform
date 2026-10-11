@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from integrations.fair_client import FairClient, FairResponse
+from integrations import fair_pdr
 from integrations.fair_pdr import (
     extract_requirements,
     suggest_verdict,
@@ -206,16 +207,20 @@ class TestExtractRequirements:
         output = json.dumps({
             "requirements": [
                 {
+                    "slug": "oauth2-sign-in",
                     "text": "System must authenticate users via OAuth2",
                     "priority": "must",
-                    "acceptance_criteria": "OAuth2 flow completes within 3 seconds",
-                    "source_span": {"start": 0, "end": 50, "quote": "authenticate users"},
+                    "kind": "functional",
+                    "quote": "The system must authenticate users via OAuth2.",
+                    "acceptance_criteria": ["OAuth2 flow completes within 3 seconds"],
                 },
                 {
+                    "slug": "live-metrics",
                     "text": "Dashboard should show real-time metrics",
                     "priority": "should",
-                    "acceptance_criteria": "Metrics update within 5 seconds",
-                    "source_span": {"start": 100, "end": 150, "quote": "real-time metrics"},
+                    "kind": "functional",
+                    "quote": "The dashboard should show real-time metrics.",
+                    "acceptance_criteria": ["Metrics update within 5 seconds"],
                 },
             ]
         })
@@ -254,7 +259,9 @@ class TestExtractRequirements:
         assert result["requirements"] == []
 
     def test_code_fenced_output(self):
-        output = '```json\n{"requirements": [{"text": "req1", "priority": "must", "acceptance_criteria": "works", "source_span": {"start": 0, "end": 5, "quote": "req"}}]}\n```'
+        output = ('```json\n{"requirements": [{"slug": "r1", "text": "req1", "priority": "must", '
+                  '"kind": "functional", "quote": "req one is stated here", '
+                  '"acceptance_criteria": ["works"]}]}\n```')
         client = _mock_client(_make_response(output=output))
         result = extract_requirements(client, "PDR text")
 
@@ -271,6 +278,26 @@ class TestExtractRequirements:
         assert call_kwargs.kwargs.get("task_type") == "extraction"
         assert call_kwargs.kwargs.get("quality_level") == "standard"
         assert call_kwargs.kwargs.get("expected_schema") is not None
+
+    def test_the_schema_is_the_shape_record_requirements_takes(self):
+        """Spec v1.1: a slug, a verbatim quote, criteria as a list; no offsets, no constraints."""
+        item = fair_pdr._REQUIREMENTS_SCHEMA["properties"]["requirements"]["items"]
+        assert item["required"] == ["slug", "text", "priority", "kind", "quote",
+                                    "acceptance_criteria"]
+        assert set(item["properties"]) == set(item["required"])
+        assert item["properties"]["acceptance_criteria"] == {
+            "type": "array", "items": {"type": "string"}}
+        assert item["properties"]["kind"]["enum"] == ["functional", "non_functional",
+                                                      "constraint"]
+
+    def test_the_prompt_asks_for_a_verbatim_quote_and_no_offsets(self):
+        client = _mock_client(_make_response(output='{"requirements": []}'))
+        extract_requirements(client, "My PDR")
+        task = client.solve.call_args.kwargs["task"]
+        assert "copied character for character" in task
+        assert "never continue a quote across a heading" in task
+        assert "Do not give character offsets" in task
+        assert "approximate character offset" not in task and "source_span" not in task
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +393,60 @@ class TestSuggestVerdict:
         call_kwargs = client.solve.call_args
         task_text = call_kwargs.kwargs.get("task", call_kwargs.args[0] if call_kwargs.args else "")
         assert "license_allowlist" in task_text
+
+    def test_reject_is_not_offered_and_not_returned(self):
+        """
+        REJECT is a statement about candidates, not an outcome for a need:
+        record_decision refuses it as a proposal. A model that answers it
+        anyway is read as BUILD, and the result says so.
+        """
+        assert fair_pdr.VERDICTS == ("ADOPT", "ADAPT", "WRAP", "REFERENCE", "BUILD")
+        assert fair_pdr._VERDICT_SCHEMA["properties"]["verdict"]["enum"] == list(fair_pdr.VERDICTS)
+        client = _mock_client(_make_response(
+            output='{"verdict": "REJECT", "rationale": "No match", '
+                   '"chosen_capability_version_id": "cv-9"}'))
+        result = suggest_verdict(client, req_id="r", description="d", constraints=[],
+                                 candidates=[])
+        assert result["verdict"] == "BUILD" and result["chosen_capability_version_id"] is None
+        assert "'REJECT'" in result["note"] and "read as BUILD" in result["note"]
+        assert "REJECT" not in client.solve.call_args.kwargs["task"]
+
+    @pytest.mark.parametrize("answer,verdict,chosen,noted", [
+        ("adopt", "ADOPT", "cv-1", False), (" Wrap ", "WRAP", "cv-1", False),
+        ("BUILD", "BUILD", None, False), ("MAYBE", "BUILD", None, True),
+        (None, "BUILD", None, False),
+    ])
+    def test_the_verdict_is_one_record_decision_takes(self, answer, verdict, chosen, noted):
+        client = _mock_client(_make_response(output=json.dumps(
+            {"verdict": answer, "rationale": "x", "chosen_capability_version_id": "cv-1"})))
+        result = suggest_verdict(client, req_id="r", description="d", constraints=[],
+                                 candidates=[])
+        assert result["verdict"] == verdict
+        assert result["chosen_capability_version_id"] == chosen
+        assert (result["note"] is not None) is noted
+
+    def test_the_model_is_told_how_far_to_trust_each_candidate(self):
+        """An unread candidate's fit score means 'not read', and the prompt has to say so."""
+        client = _mock_client(_make_response(
+            output='{"verdict": "BUILD", "rationale": "x", "chosen_capability_version_id": null}'))
+        suggest_verdict(client, req_id="r", description="d", constraints=[], candidates=[
+            {"display_name": "Read Lib", "capability_version_id": "cv-1", "fit_score": 0.0,
+             "blocking_gap_count": 1, "evidence": "sufficient", "missing_evidence": [],
+             "confirmed_blocking_gaps": ["license_mismatch"], "license": "GPL-3.0",
+             "license_source": "evidence"},
+            {"display_name": "Unread Lib", "capability_version_id": "cv-2", "fit_score": 0.0,
+             "blocking_gap_count": 1, "evidence": "insufficient",
+             "missing_evidence": ["license", "interfaces"], "confirmed_blocking_gaps": [],
+             "license": "MIT", "license_source": "metadata"},
+            {"display_name": "Old Caller Lib", "capability_version_id": "cv-3"},
+        ])
+        task = client.solve.call_args.kwargs["task"]
+        assert ("evidence=sufficient, missing=none, confirmed_gaps=license_mismatch, "
+                "license=GPL-3.0 (read from source)") in task
+        assert ("evidence=insufficient, missing=license, interfaces, confirmed_gaps=none, "
+                "license=MIT (registry metadata, not read from source)") in task
+        assert "evidence=not stated, missing=none, confirmed_gaps=none, license=not read" in task
+        assert "evidence=insufficient means the registry has NOT read" in task
 
     def test_multiple_candidates_formatted(self):
         client = _mock_client(_make_response(
@@ -472,10 +553,12 @@ class TestFairPipeline:
         extract_output = json.dumps({
             "requirements": [
                 {
+                    "slug": "http-client",
                     "text": "Need an HTTP client library",
                     "priority": "must",
-                    "acceptance_criteria": "Can make GET and POST requests",
-                    "source_span": {"start": 0, "end": 30, "quote": "HTTP client"},
+                    "kind": "functional",
+                    "quote": "The service needs an HTTP client library.",
+                    "acceptance_criteria": ["Can make GET and POST requests"],
                 },
             ]
         })
