@@ -1652,6 +1652,13 @@ def cmd_fair_status(args) -> int:
         for p in status["providers"]:
             models = ", ".join(one_line(m) for m in p.get("models") or [])
             print(f"  {one_line(p['provider_id'])}: {one_line(p['status'])} ({models})")
+        for provider_id, why in sorted((status.get("skipped") or {}).items()):
+            print(f"  {one_line(provider_id)}: NOT USED ({one_line(why, 300)})")
+        if status["available"]:
+            # ONLINE means FAIR has a provider to route to. Nothing was sent.
+            print("  Configured. No request was sent, so a key is not proven until a call succeeds.")
+        if status.get("hint"):
+            print(f"  Hint: {one_line(status['hint'], 600)}")
     return 0
 
 

@@ -1677,9 +1677,13 @@ def fair_status() -> dict[str, Any]:
     """
     Check whether FAIR is installed and has at least one provider configured.
 
-    Returns {available, client_id, providers[], error}. Each provider has
-    {provider_id, status, access_class, models[]}. error explains why
-    available is False (package missing, no provider keys, ...).
+    Returns {available, client_id, providers[], skipped{}, hint, error}.
+    Each provider has {provider_id, status, access_class, models[]}.
+    skipped maps a configured provider FAIR is not using to the reason.
+    error explains why available is False (package missing, no usable
+    provider, ...). hint is set when a key is present for a provider that
+    FAIR will only use once the operator has confirmed, in .env, that its
+    account cannot be billed; that confirmation is the operator's to make.
     """
     from integrations.fair_client import FairClient
     return FairClient().status()

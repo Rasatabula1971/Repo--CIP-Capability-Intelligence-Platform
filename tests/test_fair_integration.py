@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from integrations import fair_client
 from integrations.fair_client import FairClient, FairResponse
 from integrations import fair_pdr
 from integrations.fair_pdr import (
@@ -129,11 +132,132 @@ class TestFairClient:
         assert status["error"]
 
 
+class TestFreeTierConfirmation:
+    """
+    FAIR will not use a Gemini, Groq, Mistral or Cloudflare key until the
+    operator confirms the account behind it cannot be billed. Its service
+    reads FAIR_CONFIRMED_FREE_PROVIDERS; its embedded constructor does not.
+    CIP's client passed nothing, so one of those keys alone could never
+    bring FAIR up, and the status said only "no eligible provider".
+
+    A stand-in `fair` module records what the client asks for, so these
+    run whether or not FAIR is installed.
+    """
+
+    @pytest.fixture
+    def asked(self, monkeypatch):
+        seen: dict[str, Any] = {}
+
+        class FAIR:
+            skipped = {"groq": "explicit free-tier account confirmation required"}
+
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+                if kwargs.get("fail"):
+                    raise ValueError("no eligible provider")
+
+            def providers(self):
+                return [{"provider_id": "openrouter_free", "status": "ACTIVE", "models": ["m"]}]
+
+        monkeypatch.setitem(sys.modules, "fair", types.SimpleNamespace(FAIR=FAIR))
+        for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY",
+                     "CLOUDFLARE_API_TOKEN", fair_client.CONFIRMED_ENV):
+            monkeypatch.delenv(name, raising=False)
+        return seen
+
+    @pytest.mark.parametrize("value,expected", [
+        ("groq", {"groq"}), (" groq , google_gemini_api,, ", {"groq", "google_gemini_api"}),
+        ("", set()), (" , ", set()),
+    ])
+    def test_the_setting_is_a_comma_separated_list(self, monkeypatch, value, expected):
+        monkeypatch.setenv(fair_client.CONFIRMED_ENV, value)
+        assert fair_client.confirmed_free_providers() == expected
+
+    def test_the_confirmation_reaches_fair(self, asked, monkeypatch):
+        monkeypatch.setenv(fair_client.CONFIRMED_ENV, "groq, google_gemini_api")
+        FairClient()._build()
+        assert asked["confirmed_free_providers"] == {"groq", "google_gemini_api"}
+
+    def test_nothing_is_confirmed_on_the_operators_behalf(self, asked, monkeypatch):
+        """A key is not a confirmation. With the setting empty, CIP asserts nothing."""
+        monkeypatch.setenv("GROQ_API_KEY", "k")
+        monkeypatch.setenv("GEMINI_API_KEY", "k")
+        FairClient()._build()
+        assert "confirmed_free_providers" not in asked
+
+    def test_a_key_fair_is_not_using_is_named(self, asked, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "k")
+        monkeypatch.setenv("GEMINI_API_KEY", "  ")              # blank is not a key
+        monkeypatch.setenv("MISTRAL_API_KEY", "k")
+        monkeypatch.setenv(fair_client.CONFIRMED_ENV, "mistral")
+        assert fair_client.unconfirmed_keys() == ["groq"]
+        status = FairClient().status()
+        assert status["available"] is True
+        assert status["skipped"] == {"groq": "explicit free-tier account confirmation required"}
+        assert "A key is set for groq, and FAIR is not using it" in status["hint"]
+        assert f"{fair_client.CONFIRMED_ENV}=groq" in status["hint"]
+        assert "only if that is true" in status["hint"]
+
+    def test_the_hint_is_given_when_fair_will_not_start(self, asked, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "k")
+        client = FairClient()
+        monkeypatch.setattr(client, "_build", lambda: (_ for _ in ()).throw(ValueError("none")))
+        status = client.status()
+        assert status["available"] is False and status["error"] == "none"
+        assert f"{fair_client.CONFIRMED_ENV}=google_gemini_api" in status["hint"]
+        assert status["providers"] == [] and status["skipped"] == {}
+
+    def test_no_hint_when_nothing_is_waiting(self, asked, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "k")
+        monkeypatch.setenv(fair_client.CONFIRMED_ENV, "groq")
+        assert FairClient().status()["hint"] is None
+
+
 try:
     import fair as _fair  # noqa: F401
     _HAS_FAIR = True
 except ImportError:
     _HAS_FAIR = False
+
+
+@pytest.mark.skipif(not _HAS_FAIR, reason="fair-free-ai-router not installed")
+class TestConfirmationAgainstFair:
+    """The same rule through the real FAIR constructor. No request is sent."""
+
+    def status(self, env: dict[str, str]) -> dict[str, Any]:
+        with patch.dict("os.environ", env, clear=True):
+            return FairClient().status()
+
+    def test_a_recurring_key_alone_does_not_bring_fair_up(self):
+        status = self.status({"GROQ_API_KEY": "dummy"})
+        assert status["available"] is False and "safely eligible provider" in status["error"]
+        assert "FAIR_CONFIRMED_FREE_PROVIDERS=groq" in status["hint"]
+
+    @pytest.mark.parametrize("key,provider_id", [
+        ("GROQ_API_KEY", "groq"), ("GEMINI_API_KEY", "google_gemini_api")])
+    def test_a_confirmed_recurring_key_does(self, key, provider_id):
+        status = self.status({key: "dummy", "FAIR_CONFIRMED_FREE_PROVIDERS": provider_id})
+        assert status["available"] is True and status["hint"] is None
+        assert [p["provider_id"] for p in status["providers"]] == [provider_id]
+
+    def test_a_runtime_zero_cost_provider_needs_none(self):
+        status = self.status({"OPENROUTER_API_KEY": "dummy", "GEMINI_API_KEY": "dummy"})
+        assert [p["provider_id"] for p in status["providers"]] == ["openrouter_free"]
+        assert "confirmation required" in status["skipped"]["google_gemini_api"]
+        assert "FAIR_CONFIRMED_FREE_PROVIDERS=google_gemini_api" in status["hint"]
+
+    def test_a_name_fair_does_not_know_is_an_error_not_a_guess(self):
+        status = self.status({"OPENROUTER_API_KEY": "dummy",
+                              "FAIR_CONFIRMED_FREE_PROVIDERS": "nonsense"})
+        assert status["available"] is False
+        assert "Unknown confirmed free provider(s): nonsense" in status["error"]
+
+    def test_the_names_cip_hints_at_are_fairs_own(self):
+        """CIP's table of which key belongs to which provider must match FAIR's."""
+        from fair.embedded.module import _CLOUD_PROVIDERS, _RUNTIME_ZERO_COST_PROVIDERS
+        fairs = {entry["env"]: provider_id for provider_id, entry in _CLOUD_PROVIDERS.items()
+                 if provider_id not in _RUNTIME_ZERO_COST_PROVIDERS}
+        assert fair_client._NEEDS_CONFIRMATION == fairs
 
 
 @pytest.mark.skipif(not _HAS_FAIR, reason="fair-free-ai-router not installed")
