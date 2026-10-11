@@ -11,6 +11,7 @@ def _record(conn, **overrides):
         asset_type="repo",
         url="https://github.com/acme/widget",
         code_quality="acceptable",
+        evidence_depth="code_read",
         banked=True,
         summary="A widget library.",
         useful_parts="src/queue.py",
@@ -118,3 +119,44 @@ class TestSearch:
 
     def test_empty_store(self, conn):
         assert eval_queries.search_evaluations(conn, query="anything") == []
+
+
+class TestEvidenceDepth:
+    """
+    An evaluation says how far the evaluator actually looked, and a code
+    quality grade is only allowed when the code was read. A README-only
+    look can no longer be saved looking like a graded evaluation.
+    """
+
+    def test_depth_is_required(self, conn):
+        result = _record(conn, evidence_depth=None)
+        assert "evidence_depth is required" in result["error"]
+        assert eval_queries.get_evaluation(conn, "acme-widget") is None
+
+    def test_invalid_depth(self, conn):
+        assert "invalid evidence_depth" in _record(conn, evidence_depth="skimmed")["error"]
+
+    def test_grade_requires_code_read(self, conn):
+        refused = _record(conn, evidence_depth="docs_only", code_quality="solid")
+        assert "omit code_quality" in refused["error"]
+        ungraded = _record(conn, evidence_depth="docs_only", code_quality=None)
+        assert ungraded["evidence_depth"] == "docs_only"
+        assert ungraded["code_quality"] is None
+
+    def test_database_refuses_a_grade_without_code_read(self, conn):
+        import psycopg
+        import pytest
+        _record(conn)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with conn.cursor() as cur:
+                cur.execute("UPDATE evaluation SET evidence_depth = 'metadata_only'")
+        conn.rollback()
+
+    def test_legacy_rows_keep_an_unrecorded_depth(self, conn):
+        """Seeding historical evaluations must not invent a depth for them."""
+        result = _record(conn, evidence_depth=None, allow_legacy=True)
+        assert result["evidence_depth"] is None and result["code_quality"] == "acceptable"
+
+    def test_wrap_joins_the_verdict_set(self, conn):
+        assert _record(conn, verdict="Wrap")["verdict"] == "Wrap"
+

@@ -18,6 +18,7 @@ directory, same as everything else in this repo.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -26,7 +27,10 @@ from analysis.extractors import extractor_names as _extractor_names
 from db.connection import connect
 from mcp_server import queries
 from mcp_server import pdr_queries
+from mcp_server import pdr_store
 from mcp_server import eval_queries
+
+log = logging.getLogger(__name__)
 
 
 mcp = FastMCP("cip")
@@ -614,7 +618,45 @@ def scaffold_pipeline(
     from scripts.compose.scaffold_pipeline import scaffold
     if name:
         proposal = {**proposal, "name": name}
-    return scaffold(dict(proposal), Path(out_dir))
+    # This tool writes files whose content the caller controls. Log each
+    # one, so that if it is later ingested as a PDR the human is told a
+    # CIP tool wrote it. Best-effort: the scaffold itself needs no database.
+    #
+    # In a `finally`: the scaffold writes README.md before it reads the
+    # edges, so a proposal that makes it raise there leaves the file on
+    # disk. Logging only after a clean return left that file unlabelled.
+    # When it raised there is no list of what was written, so everything
+    # the scaffold could have written in out_dir is logged instead.
+    result = None
+    try:
+        result = scaffold(dict(proposal), Path(out_dir))
+    finally:
+        written = (result["files_written"] if result
+                   else _scaffold_files_on_disk(Path(out_dir)))
+        try:
+            conn = connect()
+            try:
+                pdr_store.record_files_written_by_tool(
+                    conn, "scaffold_pipeline", str(Path(out_dir)), written)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:                         # noqa: BLE001
+            log.warning("scaffold_pipeline: could not log written files", exc_info=True)
+    return result
+
+
+def _scaffold_files_on_disk(out_dir) -> list[str]:
+    """Every path scaffold_pipeline can write under out_dir that exists."""
+    found = [name for name in ("pipeline.yaml", ".env.example", "README.md")
+             if (out_dir / name).is_file()]
+    try:
+        for name in ("README.md", "TODO.md"):
+            found += sorted(str(p.relative_to(out_dir))
+                            for p in out_dir.glob(f"stages/*/{name}") if p.is_file())
+    except OSError:
+        pass
+    return found
 
 
 @mcp.tool()
@@ -900,14 +942,60 @@ def list_adapter_specs(
 
 
 # -----------------------------------------------------------------------
-# PDR-to-Build workflow tools (vNext)
+# PDR-to-Build workflow tools (Implementation Spec v1.1)
+#
+# Order of use: pdr_status → ingest_pdr → record_requirements →
+# record_capability_needs → request_requirements_confirmation → (human)
+# → search_for_requirement → record_decision → pdr_approval_brief →
+# lock_architecture → (human) → lock_architecture(approval_request_id) →
+# record_build_progress / check_against_lock → pdr_coverage.
+#
+# There is deliberately no tool that records a human approval. Approvals
+# are given in a terminal with `cip-composer approvals`.
 # -----------------------------------------------------------------------
+
+@mcp.tool()
+def pdr_status(
+    project_id: Optional[str] = None,
+    project_name: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Where a project is in the PDR-to-Build workflow, and what is allowed next.
+
+    CALL THIS FIRST in every session. A build spans many sessions and a
+    fresh context has none of the ids. READ-ONLY.
+
+    Args:
+      project_id: UUID of the project, or
+      project_name: the name it was ingested under.
+
+    Returns {project_id, phase, next_actions[], pdr, requirements{hash,
+    confirmation, blockers[], items[]}, needs[], pending_approvals[],
+    obsolete_requests, approved_lock_request{approval_request_id, ...} |
+    null (an approved lock waiting to be written: pass its id to
+    lock_architecture), lock{version, usable, stale_reasons[],
+    drifted_needs[], decisions[], approved_providers[],
+    cost_commitments[], project_decisions[], unresolved_risks[]} | null,
+    tasks[], progress, compliance} or None if the project is not found.
+
+    A task stored as verified reads back as implemented here if its
+    evidence no longer covers every acceptance criterion.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.pdr_status(
+            conn, project_id=project_id, project_name=project_name,
+        )
+    finally:
+        conn.close()
+
 
 @mcp.tool()
 def ingest_pdr(
     project_name: str,
     pdr_title: str,
-    pdr_text: str,
+    pdr_path: Optional[str] = None,
+    pdr_text: Optional[str] = None,
     project_id: Optional[str] = None,
     stack: Optional[str] = None,
     policy_profile: Optional[str] = None,
@@ -915,24 +1003,38 @@ def ingest_pdr(
     """
     Register a project and store the PDR as the provenance root.
 
-    Creates the project if it doesn't exist. Re-ingesting identical text
-    returns the same content_hash without duplicating the source row.
+    Use pdr_path. The server reads the file itself, records the file's
+    SHA-256, and the human is shown the file name and hash when asked to
+    confirm the requirements — so they can tell which document they are
+    approving. Text passed as pdr_text has no file behind it and is shown
+    to the human as "supplied inline, not read from a file".
+
+    pdr_path must be ABSOLUTE (this server does not run in your project
+    folder) and a text document: .md, .markdown, .txt, .rst or .text.
+
+    Ingesting a different text for an existing project makes it the
+    current PDR. Requirements whose quotes still appear are carried
+    forward; the rest are reported as orphaned and must be re-recorded or
+    retired. Requirements then need confirming again and an existing lock
+    goes stale. Ingesting an earlier text again makes that one current.
 
     Args:
-      project_name: name for the project (used for create-or-lookup).
-      pdr_title: title of the PDR document.
-      pdr_text: full text of the PDR.
-      project_id: optional UUID — use existing project instead of creating.
+      project_name: name for the project (created if new).
+      pdr_title: title of the PDR document (required).
+      pdr_path: absolute path to the PDR file, readable by this server. OR
+      pdr_text: the full text (short documents only).
+      project_id: optional UUID — use an existing project.
       stack: optional tech stack hint (stored in project metadata).
       policy_profile: optional policy profile name.
 
-    Returns {project_id, requirement_source_id, content_hash, was_duplicate}.
+    Returns {project_id, requirement_source_id, content_hash, was_duplicate,
+    is_current, supersedes_id, carried_forward[]?, orphaned[]?} or {error}.
     """
     conn = connect()
     try:
         return pdr_queries.ingest_pdr(
             conn, project_name=project_name, pdr_title=pdr_title,
-            pdr_text=pdr_text, project_id=project_id,
+            pdr_text=pdr_text, pdr_path=pdr_path, project_id=project_id,
             stack=stack, policy_profile=policy_profile,
         )
     finally:
@@ -946,23 +1048,40 @@ def record_requirements(
     requirements: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """
-    Submit extracted requirements from a PDR for validation and storage.
+    Record requirements extracted from the PDR.
 
-    Each requirement must be atomic (one testable need), have non-empty
-    acceptance_criteria, a valid priority, and a source_span linking it
-    back to the PDR text.
+    Each requirement must carry a verbatim `quote` from the PDR. CIP finds
+    the quote in the stored text and computes the span itself; a quote
+    that is not in the PDR is refused. Do not send character offsets.
+    Quote the sentence that states the requirement: at most 600
+    characters, and not running across a heading into another section.
+
+    These are what the PDR asks for, not what gets searched. Reusable
+    capabilities go in record_capability_needs.
 
     Args:
       project_id: UUID of the project.
-      requirement_source_id: UUID from ingest_pdr.
-      requirements: list of {text, priority, acceptance_criteria,
-        source_span, slug?, constraints?[]}.
-        priority: 'must' | 'should' | 'could' | 'wont'.
-        source_span: {start, end, quote} pointing into the PDR.
-        constraints: optional [{kind, ...}] for requirement_constraint rows.
+      requirement_source_id: UUID from ingest_pdr (the current PDR).
+      requirements: list of {
+        text, quote,
+        slug?, kind? ('functional' | 'non_functional' | 'constraint'),
+        priority? ('must' | 'should' | 'could' | 'wont'),
+        acceptance_criteria: [str, ...]  (each one testable),
+        disposition? ('bespoke' | 'not_applicable' | 'deferred'),
+        disposition_reason? (required with a disposition)
+      }.
+      Leave disposition out for anything a capability need will satisfy.
 
-    Returns {project_id, requirement_source_id, requirements: [{req_id,
-    slug, valid, errors}]}.
+    Returns {requirements: [{index, req_id, slug, valid, errors[], span}],
+    requirements_hash, span_coverage{unmapped_sections[],
+    out_of_scope_only_sections[], lightly_quoted_sections[]}}.
+
+    Always give a `slug`. Re-recording with an explicit slug updates that
+    requirement. Without one a slug is derived from the text, and if it
+    already exists the item is refused: CIP will not guess that an update
+    was meant. A slug may appear once per call. Changing a requirement's
+    text, quote or kind discards the verification evidence recorded
+    against it. Any change re-opens the requirements confirmation.
     """
     conn = connect()
     try:
@@ -970,6 +1089,115 @@ def record_requirements(
             conn, project_id=project_id,
             requirement_source_id=requirement_source_id,
             requirements=requirements,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def record_capability_needs(
+    project_id: str,
+    needs: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """
+    Record the reusable capabilities the build needs, and link each to the
+    PDR requirements it serves.
+
+    A capability need (auth, job queue, PDF render) is the unit CIP
+    searches and decides. Derive them from the architecture sketch: one
+    need can serve several requirements, and one requirement can need
+    several capabilities. Linking a need sets the requirement's
+    disposition to via_needs.
+
+    Give constraints wherever you can. A need with no constraint cannot be
+    fit-scored, so its decision is recorded as LLM judgment, not CIP's.
+
+    search_terms and problem_types are part of what the human confirms:
+    they decide what the registry is asked. Changing either re-opens the
+    requirements confirmation and voids earlier searches. A search term
+    may not mix alphabets inside a word (a Cyrillic 'o' in 'oauth').
+    Always give a `slug`; a derived slug that already exists is refused.
+
+    Args:
+      project_id: UUID of the project.
+      needs: list of {
+        description, slug?,
+        search_terms: [1-8 short keyword phrases, e.g. 'oauth', 'pdf render'],
+        problem_types?: [tags used to recall banked evaluations, e.g. 'oauth-flow'],
+        satisfies: [requirement slugs or ids],
+        constraints?: [
+          {kind: 'required_interface', name, signature_contains?} |
+          {kind: 'license_allowlist', spdx_ids: [...]} |
+          {kind: 'forbidden_dependency', ecosystem, name}
+        ]
+      }.
+
+    Returns {needs: [{index, need_id, slug, valid, errors[], warnings[],
+    satisfies[]}], requirements_hash, blockers[]} or None.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.record_capability_needs(
+            conn, project_id=project_id, needs=needs,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def retire_requirement(
+    req_id: str,
+    reason: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Take a requirement or a capability need out of scope, on the record.
+
+    Use this when a need turns out to be unwanted — REJECT is not a valid
+    decision for a need. The row is kept; re-recording the slug restores it.
+
+    Args:
+      req_id: UUID of the requirement or need.
+      reason: why it is being retired.
+
+    Returns {req_id, slug, kind, status, blockers[]} or None.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.retire_requirement(conn, req_id=req_id, reason=reason)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def request_requirements_confirmation(
+    project_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    HUMAN GATE 1. Put the requirement set in front of the human.
+
+    Opens an approval request for the current requirements and needs, and
+    reports its state. search_for_requirement and record_decision refuse
+    until a human approves this exact content; any later edit re-opens
+    the gate, and so does returning to content approved earlier. Show the
+    returned summary_markdown to the human, then STOP and wait. You
+    cannot approve it and must not try to.
+
+    Args:
+      project_id: UUID of the project.
+
+    On a second or later confirmation the summary opens with what changed
+    since the scope the human last confirmed, and lists everything
+    retired.
+
+    Returns {status: 'blocked' | 'awaiting_approval' | 'approved' |
+    'rejected', blockers[]?, approval_request_id?, requirements_hash,
+    span_coverage, changes_since_last_confirmation[], summary_markdown?,
+    how_to_approve?} or None.
+    """
+    conn = connect()
+    try:
+        return pdr_queries.request_requirements_confirmation(
+            conn, project_id=project_id,
         )
     finally:
         conn.close()
@@ -987,25 +1215,47 @@ def search_for_requirement(
     limit: int = 20,
 ) -> Optional[dict[str, Any]]:
     """
-    Search the CIP registry and compute fit for one requirement.
+    Search the registry and the evaluation store for one capability need.
 
-    Searches the capability registry using search_query (defaults to the
-    requirement description), evaluates fit against each candidate, and
-    persists fit_evaluation rows. Call this before record_decision — a
-    BUILD verdict is refused without a prior search.
+    Call it with only req_id first. That is the mandatory sweep: every one
+    of the need's confirmed search_terms, unfiltered, taking up to 100
+    hits per term whatever `limit` says. record_decision requires it. A
+    search_query or a filter gives extra evidence but never replaces the
+    sweep. An empty-string filter is treated as no filter.
+
+    If a term returns 100 hits the result says `truncated: true`: there
+    may be matches the search never looked at, and CIP will then not
+    conclude on its own that nothing fits. Matches CIP could not evaluate
+    (no source to pin, or excluded by the project's policy) are listed in
+    `unevaluable`, and are not the same as having found nothing.
+
+    Every call is logged, including one that finds nothing. An empty
+    result is reported as no registry coverage — a fact about what CIP has
+    ingested, not proof nothing exists.
+
+    Each candidate says whether CIP holds the evidence its constraints
+    need (`evidence`: 'sufficient' | 'insufficient', with
+    `missing_evidence`: license / interfaces / dependencies / score),
+    read from the revision that would be pinned. A candidate known only
+    from registry metadata scores as a gap because nothing was read, not
+    because it failed. `confirmed_blocking_gaps` are the gaps that do
+    rest on something CIP read.
 
     Args:
-      req_id: UUID of the project_requirement row.
-      search_query: text to search for (defaults to requirement description).
-      ecosystem: filter by ecosystem (pypi, npm, source, ...).
-      capability_kind: filter by semantic role (library, cli, service, ...).
-      component_kind: filter by format (library, repo, agent, ...).
-      runtime: filter by runtime (python_import, mcp_stdio, ...).
-      cost_tier: filter by cost (free, free_tier, cheap_paid, paid).
-      limit: max candidates to evaluate (default 20).
+      req_id: UUID of the capability need (need_id from record_capability_needs).
+      search_query: optional extra query text.
+      ecosystem / capability_kind / component_kind / runtime / cost_tier:
+        optional filters.
+      limit: max candidates per query term (default 20).
 
-    Returns {req_id, slug, description, constraints, candidates[],
-    candidate_count, search_query} or None if not found.
+    Returns {req_id, slug, search_id, queries[], counts_as_mandatory_sweep,
+    registry_size, truncated, policy_excluded_count,
+    candidates[{capability_version_id, normalized_key, fit_score,
+    blocking_gap_count, confirmed_blocking_gaps[], intrinsic_score,
+    license, license_source, cost_tier, evidence, missing_evidence[]}],
+    unevaluable[], evaluation_matches[{asset_slug, verdict, banked,
+    evidence_depth, selectable}], coverage_outcome} or {refused, reason}
+    or None.
     """
     conn = connect()
     try:
@@ -1026,33 +1276,50 @@ def search_for_requirement(
 @mcp.tool()
 def record_decision(
     req_id: str,
-    verdict: str,
+    verdict: Optional[str] = None,
     chosen_capability_version_id: Optional[str] = None,
-    evidence_refs: Optional[list[str]] = None,
     rationale: str = "",
 ) -> Optional[dict[str, Any]]:
     """
-    Record the reuse/build verdict for a requirement.
+    Record the reuse/build decision for one capability need.
 
-    Enforces search-before-build: BUILD is refused unless a search
-    (fit_evaluation) exists for the requirement. Reuse verdicts require
-    a pinned capability_version_id.
+    CIP computes the verdict first, from its rules, over the candidates
+    this need's searches evaluated. `verdict` is YOUR PROPOSAL. Omit it to
+    take CIP's.
+
+      - you agree or omit it        → decided_by 'cip_rules'
+      - you disagree                → 'llm_override' (rationale required)
+      - CIP cannot compute a verdict → 'llm_judgment' (verdict and
+        rationale required). That is the case when the need has no
+        machine-checkable constraint; when CIP lacks the evidence for
+        the candidate it would choose; or, for BUILD, when it lacks the
+        evidence for ANY candidate or the sweep was truncated. "Nothing
+        fits" is a claim about all of them.
+
+    The sweep must describe the registry as it is: if the registry has
+    changed since the sweep, this call is refused until you sweep again.
+
+    Overrides and LLM judgments are listed for the human at lock time.
+    Only candidates returned by search_for_requirement can be chosen.
+    REJECT is not valid here: if nothing fits, propose BUILD; if the need
+    is unwanted, retire_requirement.
 
     Args:
-      req_id: UUID of the project_requirement.
-      verdict: one of ADOPT, ADAPT, WRAP, REFERENCE, REJECT, BUILD.
-      chosen_capability_version_id: required for ADOPT/ADAPT/WRAP/REFERENCE.
-      evidence_refs: optional list of evidence item UUIDs.
-      rationale: free-text reason for the decision.
+      req_id: UUID of the capability need.
+      verdict: optional proposal — ADOPT, ADAPT, WRAP, REFERENCE or BUILD.
+      chosen_capability_version_id: required with ADOPT/ADAPT/WRAP/REFERENCE.
+      rationale: why; required unless you take CIP's verdict.
 
-    Returns {recommendation_id, verdict} or {refused, reason} or None.
+    Returns {decision_record_id, recommendation_id, verdict, decided_by,
+    computed_verdict, computed_rule, coverage_outcome, flags[],
+    listed_for_human} or {refused, reason} or None.
     """
     conn = connect()
     try:
         return pdr_queries.record_decision(
             conn, req_id=req_id, verdict=verdict,
             chosen_capability_version_id=chosen_capability_version_id,
-            evidence_refs=evidence_refs, rationale=rationale,
+            rationale=rationale,
         )
     finally:
         conn.close()
@@ -1061,23 +1328,38 @@ def record_decision(
 @mcp.tool()
 def pdr_approval_brief(
     project_id: str,
+    architecture_doc_path: Optional[str] = None,
+    architecture_doc_text: Optional[str] = None,
+    approved_providers: Optional[list[dict[str, Any]]] = None,
+    cost_commitments: Optional[list[dict[str, Any]]] = None,
+    project_decisions: Optional[list[dict[str, Any]]] = None,
+    unresolved_risks: Optional[list[str]] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    Render the plain-language approval brief for a project.
+    Preview exactly what lock_architecture would freeze. READ-ONLY.
 
-    READ-ONLY — writes nothing. Shows every requirement's decision,
-    flags items needing human approval (paid services, unusual licenses,
-    vendor lock-in, security implications).
+    Pass the same inputs you will pass to lock_architecture: the brief and
+    the lock are computed by one function. Items needing the human's
+    attention come from structured facts (who decided, license, cost
+    tier, provider category), not from keywords.
 
-    Args:
-      project_id: UUID of the project.
+    Args: as lock_architecture.
 
-    Returns {brief_markdown, decisions[], human_approval_items[],
-    unresolved[]} or None if project not found.
+    Returns {brief_markdown, decisions[], human_approval_items[{code,
+    subject, detail}], unresolved[] (blockers), changes_from_active_lock[],
+    payload_hash, approval_state, ready_to_lock} or None.
     """
     conn = connect()
     try:
-        return pdr_queries.build_approval_brief(conn, project_id=project_id)
+        return pdr_queries.build_approval_brief(
+            conn, project_id=project_id,
+            architecture_doc_path=architecture_doc_path,
+            architecture_doc_text=architecture_doc_text,
+            approved_providers=approved_providers,
+            cost_commitments=cost_commitments,
+            project_decisions=project_decisions,
+            unresolved_risks=unresolved_risks,
+        )
     finally:
         conn.close()
 
@@ -1085,30 +1367,70 @@ def pdr_approval_brief(
 @mcp.tool()
 def lock_architecture(
     project_id: str,
-    approved_by: str,
-    approval_note: Optional[str] = None,
+    architecture_doc_path: Optional[str] = None,
+    architecture_doc_text: Optional[str] = None,
+    approved_providers: Optional[list[dict[str, Any]]] = None,
+    cost_commitments: Optional[list[dict[str, Any]]] = None,
+    project_decisions: Optional[list[dict[str, Any]]] = None,
     unresolved_risks: Optional[list[str]] = None,
+    approval_request_id: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    Freeze approved decisions into a versioned, append-only lock.
+    HUMAN GATE 2. Freeze the approved decisions into a new lock version.
 
-    Supersedes any existing active lock and creates a new version.
-    All requirements must have a recorded decision before locking.
+    Call it twice, with the human in between:
+      1st call → the lock inputs. Returns status 'awaiting_approval' and
+                 an approval_request_id. Show summary_markdown to the
+                 human, then STOP and wait.
+      (human approves in a terminal)
+      2nd call → project_id and approval_request_id ONLY. Replays exactly
+                 what was approved and writes the lock. Works from a new
+                 session: pdr_status returns the id as
+                 approved_lock_request.
+
+    You do not name the approver or write the approval note; both come
+    from the person who approves in the terminal. Changing any input
+    changes the payload and needs a fresh approval. An approval is tied
+    to the lock version it replaces and writes one lock, once. Only the
+    lock request asked for most recently can be approved: asking for a
+    different payload retires the earlier request. A relock shows its
+    diff from the active lock — that is the change request.
+
+    The lock also authorises code generation (Step 13) for every BUILD
+    need, in the approver's name.
 
     Args:
       project_id: UUID of the project.
-      approved_by: who is approving (actor name).
-      approval_note: optional note for the audit trail.
-      unresolved_risks: optional list of known risks to record.
+      architecture_doc_path: ABSOLUTE path to the architecture document
+        (.md, .markdown, .txt, .rst, .text; hashed into the lock), OR
+        architecture_doc_text.
+      approved_providers: [{name, category ('ai'|'auth'|'payment'|'hosting'|
+        'database'|'storage'|'email'|'messaging'|'analytics'|'other'),
+        purpose, cost ('free'|'free_tier'|'usage'|'recurring'|'one_off'),
+        data_leaves_infra: bool}] — every external service the build uses.
+      cost_commitments: [{item, kind, amount, currency, period}].
+      project_decisions: [{key, category, choice, rationale}] — choices
+        that belong to no single requirement (database, hosting, auth model).
+      unresolved_risks: [str].
+      approval_request_id: second call only — the approved request.
 
-    Returns {architecture_lock_id, version, source_lock_hash,
-    decision_count} or {refused, reason} or None.
+    Returns {status: 'awaiting_approval', approval_request_id,
+    summary_markdown, human_approval_items[], changes_from_active_lock[],
+    how_to_approve, then} or {architecture_lock_id, version, payload_hash,
+    approved_by, build_authorizations, unchanged?} or {refused, reason,
+    blockers[]} or {error} or None.
     """
     conn = connect()
     try:
         return pdr_queries.lock_architecture(
-            conn, project_id=project_id, approved_by=approved_by,
-            approval_note=approval_note, unresolved_risks=unresolved_risks,
+            conn, project_id=project_id,
+            architecture_doc_path=architecture_doc_path,
+            architecture_doc_text=architecture_doc_text,
+            approved_providers=approved_providers,
+            cost_commitments=cost_commitments,
+            project_decisions=project_decisions,
+            unresolved_risks=unresolved_risks,
+            approval_request_id=approval_request_id,
         )
     finally:
         conn.close()
@@ -1122,15 +1444,28 @@ def check_against_lock(
     """
     Test a proposed change against the active architecture lock.
 
-    READ-ONLY — writes nothing. Returns whether the change is allowed
-    or needs approval.
+    Call this BEFORE: adding or swapping a dependency, using a new
+    external provider, changing a locked capability, changing a locked
+    project decision (database, hosting, auth model...), or editing a
+    file outside the task's permitted_paths. Every call is logged.
+
+    The input must be structured. A description alone returns 'blocked',
+    and a key this tool does not know is escalated, never ignored.
 
     Args:
       project_id: UUID of the project.
-      proposed_change: {req_ids?, provider?, capability_version_id?,
-        description} describing the proposed change.
+      proposed_change: {
+        description,
+        build_task_id?, changed_paths?: [repo-relative paths],
+        capability_changes?: [{need: slug|id, capability_version_id?, verdict?}],
+        provider_changes?: [{name, action: 'add'|'use'|'remove'|'change'}],
+        dependency_adds?: [{ecosystem, name}],
+        project_decision_changes?: [{key, choice}]
+      }
 
-    Returns {verdict: 'allowed'|'needs_approval', reason} or None.
+    Returns {verdict: 'allowed' | 'needs_approval' | 'blocked', reasons[],
+    cited[] (the locked items each reason rests on), reminders[] (the
+    task's prohibited_changes), lock_version, next} or None.
     """
     conn = connect()
     try:
@@ -1154,32 +1489,50 @@ def record_build_progress(
     build_task_id: Optional[str] = None,
     status: Optional[str] = None,
     target_commit: Optional[str] = None,
-    verification: Optional[dict[str, Any]] = None,
+    verification: Optional[Any] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    Record coding tasks and link built modules/tests to requirements.
+    Create a build task, or report progress and verification on one.
 
-    Two modes:
-    - Create: provide project_id, architecture_lock_id, title, objective,
-      req_ids. Returns {build_task_id, status}.
-    - Update: provide build_task_id with optional status, target_commit,
-      verification. Returns {build_task_id, status}.
+    CREATE (no build_task_id) — this is the build gate. Refused unless
+    the lock is active and current, every linked requirement is in scope,
+    every capability need it rests on is locked with an unchanged
+    decision, and BUILD needs are authorised.
+      project_id, title, objective,
+      req_ids: slugs or ids. At least one PDR requirement (what the task
+        delivers); add the capability need when the task integrates or
+        builds one,
+      permitted_paths: REQUIRED — repo-relative files/directories the
+        task may touch. The first path segment must be literal: 'src/**'
+        is fine, '**' or '*/x' is refused,
+      prohibited_changes?: list of free-text reminders,
+      reused_capability_version_id?: normally leave it out. CIP fills it
+        from the lock for whichever ADOPT/ADAPT/WRAP capability the task
+        rests on — including through a requirement that need serves —
+        and returns it. If you pass one it must equal the locked version.
 
-    Args:
-      project_id: UUID (create mode).
-      architecture_lock_id: UUID (create mode).
-      title: task title (create mode).
-      objective: what this task accomplishes (create mode).
-      req_ids: list of requirement UUIDs this task satisfies (create mode).
-      permitted_paths: optional file paths this task may touch.
-      prohibited_changes: optional architectural changes forbidden.
-      reused_capability_version_id: optional UUID for reuse tasks.
-      build_task_id: UUID (update mode).
-      status: planned|in_progress|implemented|verified|abandoned.
+    UPDATE (build_task_id given):
+      status: planned → in_progress → implemented → verified, or abandoned.
       target_commit: commit SHA in the target repo.
-      verification: {req_id, outcome, evidence_ref} to record.
+      verification: one object or a list of {
+        criterion_id | (req_id + criterion_ordinal),
+        outcome: 'pass' | 'fail' | 'not_run',
+        commit_sha, test_ref, command, exit_code   (all required for a pass),
+        output_digest?, evidence_ref?
+      }
+    'verified' requires a passing latest verification for every acceptance
+    criterion of every linked requirement. It does not outlive its
+    evidence: a later fail, a new criterion or a rewritten criterion
+    moves the task back to implemented. Evidence counts only while the
+    task that recorded it is current and not abandoned. Updates are
+    refused while the lock is stale, and while a decision the task rests
+    on has changed since the lock (you may still abandon a task). An
+    abandoned task is closed.
+    Verifications reported here are recorded as agent_reported; the human
+    can run `cip-composer verify` to have CIP execute the test itself.
+    commit_sha must be a hex git SHA.
 
-    Returns {build_task_id, status} or {error}.
+    Returns {build_task_id, status, ...} or {error, refused?, reasons[]?}.
     """
     conn = connect()
     try:
@@ -1202,16 +1555,20 @@ def pdr_coverage(
     project_id: str,
 ) -> Optional[dict[str, Any]]:
     """
-    Report PDR implementation progress.
+    How much of the PDR is built, and on what evidence. READ-ONLY.
 
-    READ-ONLY — writes nothing. Shows how much of the PDR is decided,
-    tasked, implemented, and verified.
+    Reports its denominators: PDR sections with no requirement mapped;
+    requirements in scope vs deferred; what the registry could answer and
+    who decided; in-scope requirements decided → locked → tasked →
+    implemented → verified, with verified split by evidence source
+    (agent_reported vs cip_executed); and compliance signals such as
+    tasks worked on with no check_against_lock on record.
 
     Args:
       project_id: UUID of the project.
 
-    Returns {project_id, project_name, total_requirements, decided,
-    tasked, implemented, verified, by_requirement[]} or None.
+    Returns {project_id, project_name, pdr, requirements, needs, progress,
+    compliance, by_requirement[]} or None.
     """
     conn = connect()
     try:
@@ -1341,6 +1698,7 @@ def record_evaluation(
     license_notes: str = "",
     cip_status: str = "not-ingested",
     evaluated_at: Optional[str] = None,
+    evidence_depth: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Record an asset evaluation in the durable evaluation store.
@@ -1352,10 +1710,14 @@ def record_evaluation(
 
     Args:
       asset_slug: unique slug, e.g. 'msitarzewski-agency-agents'.
-      verdict: Adopt | Adapt | Reference | Reject | Build.
+      verdict: Adopt | Adapt | Wrap | Reference | Reject | Build.
       asset_type: repo | skill | agent | mcp_server | prompt | workflow.
       url: source URL.
-      code_quality: solid | acceptable | fragile | untested.
+      evidence_depth: REQUIRED. How far you actually looked:
+        'code_read' (read the source), 'docs_only' (README/docs),
+        'metadata_only' (stars, license, description).
+      code_quality: solid | acceptable | fragile | untested. Only allowed
+        with evidence_depth 'code_read'; omit it otherwise.
       banked: true if worth keeping for the future regardless of project fit.
       summary: one-sentence what-it-is.
       code_quality_notes: what you found reading the source.
@@ -1379,7 +1741,7 @@ def record_evaluation(
             skip_notes=skip_notes, banked_references=banked_references,
             projects=projects, problem_types=problem_types,
             license_notes=license_notes, cip_status=cip_status,
-            evaluated_at=evaluated_at,
+            evaluated_at=evaluated_at, evidence_depth=evidence_depth,
         )
     finally:
         conn.close()

@@ -15,14 +15,19 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-_VALID_VERDICTS = {"Adopt", "Adapt", "Reference", "Reject", "Build"}
+# Same reuse verdicts as the recommendation table (Adopt/Adapt/Wrap/
+# Reference/Reject/Build), in the evaluation store's title-case spelling.
+_VALID_VERDICTS = {"Adopt", "Adapt", "Wrap", "Reference", "Reject", "Build"}
 _VALID_ASSET_TYPES = {"repo", "skill", "agent", "mcp_server", "prompt", "workflow"}
 _VALID_QUALITY = {"solid", "acceptable", "fragile", "untested", None}
+# How far the evaluator actually looked. A code-quality grade is only
+# meaningful if the code was read.
+_VALID_EVIDENCE_DEPTH = {"code_read", "docs_only", "metadata_only"}
 
 _COLUMNS = """
     id::text, asset_slug, asset_type, url, verdict, code_quality, banked,
     summary, code_quality_notes, useful_parts, skip_notes, banked_references,
-    projects, problem_types, license_notes, cip_status,
+    projects, problem_types, license_notes, cip_status, evidence_depth,
     evaluated_at::text, created_at::text, updated_at::text
 """
 
@@ -51,10 +56,20 @@ def record_evaluation(
     license_notes: str = "",
     cip_status: str = "not-ingested",
     evaluated_at: Optional[str] = None,
+    evidence_depth: Optional[str] = None,
+    allow_legacy: bool = False,
 ) -> dict[str, Any]:
     """
     Insert or update one evaluation. Upserts by asset_slug — re-evaluating
     the same asset overwrites the prior row rather than duplicating it.
+
+    evidence_depth is required: 'code_read', 'docs_only' or
+    'metadata_only'. code_quality may only be given with 'code_read', so a
+    README-level look cannot be saved as a graded evaluation.
+
+    allow_legacy=True lets a caller re-save an evaluation made before
+    evidence_depth existed without inventing a depth for it. It is for
+    seeding historical data and is not exposed through the MCP tool.
 
     Returns the stored evaluation, or {"error": ...} on invalid input.
     """
@@ -67,6 +82,22 @@ def record_evaluation(
         return {"error": f"invalid asset_type '{asset_type}' (must be one of {sorted(_VALID_ASSET_TYPES)})"}
     if code_quality not in _VALID_QUALITY:
         return {"error": f"invalid code_quality '{code_quality}'"}
+    if evidence_depth is None:
+        if not allow_legacy:
+            return {
+                "error": "evidence_depth is required: one of "
+                         f"{sorted(_VALID_EVIDENCE_DEPTH)} (how far you actually looked)"
+            }
+    elif evidence_depth not in _VALID_EVIDENCE_DEPTH:
+        return {
+            "error": f"invalid evidence_depth '{evidence_depth}' "
+                     f"(must be one of {sorted(_VALID_EVIDENCE_DEPTH)})"
+        }
+    elif evidence_depth != "code_read" and code_quality is not None:
+        return {
+            "error": f"code_quality can only be graded when the code was read; "
+                     f"evidence_depth is '{evidence_depth}', so omit code_quality"
+        }
 
     params = {
         "asset_slug": slug,
@@ -85,6 +116,7 @@ def record_evaluation(
         "license_notes": license_notes,
         "cip_status": cip_status,
         "evaluated_at": evaluated_at,
+        "evidence_depth": evidence_depth,
     }
 
     sql = f"""
@@ -92,13 +124,13 @@ def record_evaluation(
             asset_slug, asset_type, url, verdict, code_quality, banked,
             summary, code_quality_notes, useful_parts, skip_notes,
             banked_references, projects, problem_types, license_notes,
-            cip_status, evaluated_at
+            cip_status, evaluated_at, evidence_depth
         ) VALUES (
             %(asset_slug)s, %(asset_type)s, %(url)s, %(verdict)s,
             %(code_quality)s, %(banked)s, %(summary)s, %(code_quality_notes)s,
             %(useful_parts)s, %(skip_notes)s, %(banked_references)s,
             %(projects)s, %(problem_types)s, %(license_notes)s,
-            %(cip_status)s, %(evaluated_at)s
+            %(cip_status)s, %(evaluated_at)s, %(evidence_depth)s
         )
         ON CONFLICT (asset_slug) DO UPDATE SET
             asset_type         = EXCLUDED.asset_type,
@@ -116,12 +148,36 @@ def record_evaluation(
             license_notes      = EXCLUDED.license_notes,
             cip_status         = EXCLUDED.cip_status,
             evaluated_at       = EXCLUDED.evaluated_at,
+            evidence_depth     = EXCLUDED.evidence_depth,
             updated_at         = now()
         RETURNING {_COLUMNS}
     """
     with conn.cursor() as cur:
+        # The store upserts by slug, so saving an evaluation can also be
+        # un-saving one: a banked asset rewritten as a plain Reject stops
+        # being recalled, and a later build decision reads "nothing
+        # banked". Keep what was there before, in the audit trail.
+        cur.execute(
+            "SELECT verdict, banked, problem_types, evidence_depth FROM evaluation "
+            "WHERE asset_slug = %(asset_slug)s",
+            params,
+        )
+        before = cur.fetchone()
         cur.execute(sql, params)
         result = _row_to_dict(cur)[0]
+        if before is not None:
+            was = {"verdict": before[0], "banked": before[1],
+                   "problem_types": sorted(before[2] or []), "evidence_depth": before[3]}
+            now = {"verdict": result["verdict"], "banked": result["banked"],
+                   "problem_types": sorted(result.get("problem_types") or []),
+                   "evidence_depth": result.get("evidence_depth")}
+            if was != now:
+                cur.execute(
+                    "INSERT INTO audit_event (project_id, event_type, subject_table, "
+                    "subject_id, payload) VALUES (NULL, 'evaluation_replaced', "
+                    "'evaluation', %s, %s::jsonb)",
+                    (result["asset_slug"], json.dumps({"before": was, "after": now})),
+                )
     conn.commit()
     return result
 

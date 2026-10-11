@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cip"
-version = "0.2.0"
+version = "0.3.0"
 description = "Capability Intelligence Platform — composable-component registry with LLM-in-chat search + pipeline composition"
 readme = "README.md"
 license = { text = "MIT" }

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import psycopg
@@ -34,6 +34,7 @@ from core.project.rules import RulesProfile, evaluate, load as load_rules
 from core.project.types import (
     CandidateInputs,
     Constraint,
+    Decision,
     DependencyEvidence,
     FitResult,
     InterfaceEvidence,
@@ -42,6 +43,21 @@ from core.project.types import (
     ScoredCandidate,
     Verdict,
 )
+
+
+# License evidence that says what the license IS. The extractor also emits
+# a row for a LICENSE file it could not identify (spdx_id 'unknown'), and
+# one at 'low' confidence when a file only mentions a license by name (any
+# BSD-2 text gets one). Neither is a license anybody read: "there is a
+# file" is not "it is GPL", and "it mentions BSD" is not "it is BSD".
+# Used here, by the loader the fit matcher reads, and by the PDR workflow
+# wherever it says a license was read.
+IDENTIFIED_LICENSE = """
+    ei.evidence_type = 'license'
+    AND ei.extracted_value->>'spdx_id' IS NOT NULL
+    AND lower(ei.extracted_value->>'spdx_id') NOT IN ('', 'unknown', 'noassertion')
+    AND COALESCE(lower(ei.extracted_value->>'confidence'), 'high') NOT IN ('low', 'unknown')
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -64,19 +80,58 @@ class RecommendationOutcome:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def recommend_for_requirement(
+@dataclass(frozen=True)
+class RecommendationPreview:
+    """
+    Steps 1-5 of a recommendation: candidates evaluated, ranked and run
+    through the rules, but no recommendation row written yet.
+    """
+    project_requirement_id: uuid.UUID
+    profile_id: uuid.UUID
+    decision: Decision
+    winner: ScoredCandidate | None
+    ranked: list[ScoredCandidate]
+    fit_id_by_cv: dict[uuid.UUID, uuid.UUID]
+    # What the rules would say about each ranked candidate taken on its own,
+    # keyed by capability_version_id. The recommendation is still the rules
+    # applied to the best-ranked one (`decision`); this is for a caller that
+    # needs to know whether "rejected" describes one candidate or all of them.
+    rule_decisions: dict[str, Decision] = field(default_factory=dict)
+
+    @property
+    def verdict(self) -> Verdict:
+        return self.decision.verdict
+
+    @property
+    def rule_name(self) -> str:
+        return self.decision.rule_name
+
+    @property
+    def chosen_capability_version_id(self) -> uuid.UUID | None:
+        if self.winner and self.decision.verdict not in (Verdict.REJECT, Verdict.BUILD):
+            return uuid.UUID(self.winner.inputs.capability_version_id)
+        return None
+
+
+def preview_recommendation(
     conn: psycopg.Connection,
     *,
     project_requirement_id: uuid.UUID,
     rules_profile: RulesProfile,
     candidate_capability_version_ids: list[uuid.UUID] | None = None,
-) -> RecommendationOutcome:
+) -> RecommendationPreview:
     """
-    Compute + persist a recommendation for one requirement.
+    Compute what recommend_for_requirement would decide, without replacing
+    the requirement's recommendation row.
 
-    If candidate_capability_version_ids is None, we consider every
-    capability_version with at least one scorecard row. Callers can
-    pass a narrower set for tests or for targeted re-recommendation.
+    A caller that may still refuse (the PDR workflow validates a proposed
+    verdict against the computed one) needs the answer before the write:
+    replacing the recommendation cascades away its build_authorization,
+    and that must not happen for a decision that ends up refused.
+
+    Fit evaluations ARE persisted here. They are a derived, idempotent
+    upsert per (requirement, capability_version) and carry no authority.
+    Does not commit.
     """
     requirement = _load_requirement(conn, project_requirement_id)
     profile_id = _upsert_rules_profile(conn, rules_profile)
@@ -115,17 +170,10 @@ def recommend_for_requirement(
 
     # Decide.
     if not ranked:
-        # No candidates at all → BUILD (needs Step 13 authorization).
-        decision = evaluate(
-            rules_profile,
-            fit_score=0.0,
-            intrinsic_score=0.0,
-            blocking_gap_count=0,
-        )
-        # Force BUILD regardless of rules — with no candidates, nothing
-        # else makes sense. The rule engine's default is also BUILD, so
-        # this is a defensive alignment.
-        from core.project.types import Decision
+        # No candidates at all -> BUILD (needs Step 13 authorization).
+        # Force BUILD regardless of rules: with no candidates, nothing
+        # else makes sense. The sentinel rule name is what Step 13 reads
+        # as proof that a search ran and found nothing.
         decision = Decision(
             verdict=Verdict.BUILD,
             rule_name="__no_candidates__",
@@ -141,11 +189,66 @@ def recommend_for_requirement(
             blocking_gap_count=winner.fit_result.blocking_gap_count,
         )
 
-    # Persist recommendation + candidates.
+    rule_decisions = {
+        s.inputs.capability_version_id: evaluate(
+            rules_profile,
+            fit_score=s.fit_result.fit_score,
+            intrinsic_score=s.inputs.intrinsic_score,
+            blocking_gap_count=s.fit_result.blocking_gap_count,
+        )
+        for s in ranked
+    }
+    return RecommendationPreview(
+        project_requirement_id=project_requirement_id,
+        profile_id=profile_id,
+        decision=decision,
+        winner=winner,
+        ranked=ranked,
+        fit_id_by_cv=fit_id_by_cv,
+        rule_decisions=rule_decisions,
+    )
+
+
+def recommend_for_requirement(
+    conn: psycopg.Connection,
+    *,
+    project_requirement_id: uuid.UUID,
+    rules_profile: RulesProfile,
+    candidate_capability_version_ids: list[uuid.UUID] | None = None,
+) -> RecommendationOutcome:
+    """
+    Compute + persist a recommendation for one requirement.
+
+    If candidate_capability_version_ids is None, we consider every
+    capability_version with at least one scorecard row. Callers can
+    pass a narrower set for tests or for targeted re-recommendation.
+    """
+    preview = preview_recommendation(
+        conn,
+        project_requirement_id=project_requirement_id,
+        rules_profile=rules_profile,
+        candidate_capability_version_ids=candidate_capability_version_ids,
+    )
+    return persist_recommendation(conn, preview)
+
+
+def persist_recommendation(
+    conn: psycopg.Connection, preview: RecommendationPreview, *, commit: bool = True,
+) -> RecommendationOutcome:
+    """
+    Write the recommendation + recommendation_candidate rows for a
+    preview, replacing any prior recommendation for the requirement.
+    Commits, unless commit=False: a caller that writes more rows which
+    must stand or fall with this one (the PDR workflow's decision record)
+    commits once, itself.
+    """
+    decision, winner, ranked = preview.decision, preview.winner, preview.ranked
+    project_requirement_id = preview.project_requirement_id
+
     rec_id = _persist_recommendation(
         conn,
         project_requirement_id=project_requirement_id,
-        profile_id=profile_id,
+        profile_id=preview.profile_id,
         decision=decision,
         winner=winner,
     )
@@ -153,9 +256,10 @@ def recommend_for_requirement(
         conn,
         recommendation_id=rec_id,
         ranked=ranked,
-        fit_id_by_cv=fit_id_by_cv,
+        fit_id_by_cv=preview.fit_id_by_cv,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
     return RecommendationOutcome(
         recommendation_id=rec_id,
@@ -241,12 +345,12 @@ def _load_candidate_inputs(
         # Pinned revision + asset — take the most recent source binding.
         cur.execute(
             """
-            SELECT sr.revision_key, sa.external_key
+            SELECT sr.revision_key, sa.external_key, sr.id
             FROM capability_source_binding csb
             JOIN source_revision sr ON sr.id = csb.source_revision_id
             JOIN source_asset sa    ON sa.id = sr.source_asset_id
             WHERE csb.capability_version_id = %s
-            ORDER BY sr.identified_at DESC
+            ORDER BY sr.identified_at DESC, sr.id DESC
             LIMIT 1
             """,
             (str(cv_id),),
@@ -254,18 +358,47 @@ def _load_candidate_inputs(
         binding = cur.fetchone()
         if not binding:
             return None
-        pinned_revision_key, pinned_source_asset_key = binding
+        pinned_revision_key, pinned_source_asset_key, pinned_revision_id = binding
 
-        # Interfaces.
+        # Interfaces, dependencies and licenses are read for the PINNED
+        # revision only. A capability version can be bound to several
+        # revisions; what was extracted from an older one says nothing
+        # about the one that would be installed.
+        #
+        # Interfaces and dependencies are read from two places: the
+        # capability_interface / capability_dependency rows promotion
+        # linked to this version, and the evidence on the pinned revision
+        # that promotion did NOT link. Promotion is a no-op for a revision
+        # that already has a binding, and every metadata ingest creates the
+        # binding first. A component found by search and analysed
+        # afterwards therefore had all its evidence in evidence_item and
+        # none of it linked: the matcher read an empty list, saw no
+        # forbidden dependency in it, and CIP adopted a component whose
+        # manifest named one. The evidence layer is the record of what was
+        # observed; the link tables are a copy of it. Unlinked rows are
+        # mapped exactly as promotion maps them.
         cur.execute(
             """
-            SELECT evidence_item_id, kind, name,
-                   COALESCE(signature, ''), language
-            FROM capability_interface
-            WHERE capability_version_id = %s
-            ORDER BY name
+            SELECT ci.evidence_item_id, ci.kind, ci.name,
+                   COALESCE(ci.signature, '') AS signature, ci.language
+            FROM capability_interface ci
+            JOIN evidence_item ei ON ei.id = ci.evidence_item_id
+            WHERE ci.capability_version_id = %(cv)s
+              AND ei.source_revision_id = %(rev)s
+            UNION ALL
+            SELECT ei.id, COALESCE(ei.extracted_value->>'kind', 'unknown'),
+                   COALESCE(ei.extracted_value->>'name', ''),
+                   COALESCE(ei.extracted_value->>'signature', ''),
+                   ei.extracted_value->>'language'
+            FROM evidence_item ei
+            WHERE ei.source_revision_id = %(rev)s
+              AND ei.evidence_type = 'interface'
+              AND NOT EXISTS (SELECT 1 FROM capability_interface ci
+                               WHERE ci.evidence_item_id = ei.id
+                                 AND ci.capability_version_id = %(cv)s)
+            ORDER BY 3, 1
             """,
-            (str(cv_id),),
+            {"cv": str(cv_id), "rev": pinned_revision_id},
         )
         interfaces = tuple(
             InterfaceEvidence(
@@ -278,13 +411,25 @@ def _load_candidate_inputs(
         # Dependencies.
         cur.execute(
             """
-            SELECT evidence_item_id, depends_on_ecosystem,
-                   depends_on_name, dep_kind
-            FROM capability_dependency
-            WHERE capability_version_id = %s
-            ORDER BY depends_on_ecosystem, depends_on_name
+            SELECT cd.evidence_item_id, cd.depends_on_ecosystem,
+                   cd.depends_on_name, cd.dep_kind
+            FROM capability_dependency cd
+            JOIN evidence_item ei ON ei.id = cd.evidence_item_id
+            WHERE cd.capability_version_id = %(cv)s
+              AND ei.source_revision_id = %(rev)s
+            UNION ALL
+            SELECT ei.id, COALESCE(ei.extracted_value->>'ecosystem', 'unknown'),
+                   COALESCE(ei.extracted_value->>'name', ''),
+                   COALESCE(ei.extracted_value->>'kind', 'runtime')
+            FROM evidence_item ei
+            WHERE ei.source_revision_id = %(rev)s
+              AND ei.evidence_type = 'dependency'
+              AND NOT EXISTS (SELECT 1 FROM capability_dependency cd
+                               WHERE cd.evidence_item_id = ei.id
+                                 AND cd.capability_version_id = %(cv)s)
+            ORDER BY 2, 3, 1
             """,
-            (str(cv_id),),
+            {"cv": str(cv_id), "rev": pinned_revision_id},
         )
         deps = tuple(
             DependencyEvidence(
@@ -294,19 +439,17 @@ def _load_candidate_inputs(
             for r in cur.fetchall()
         )
 
-        # Licenses — pulled from evidence_item rows for the bound
-        # revision(s). Same pattern as scoring's evidence load.
+        # Licenses — evidence_item rows for the pinned revision. Same
+        # pattern as scoring's evidence load.
         cur.execute(
-            """
+            f"""
             SELECT ei.id, ei.extracted_value
             FROM evidence_item ei
-            JOIN capability_source_binding csb
-              ON csb.source_revision_id = ei.source_revision_id
-            WHERE csb.capability_version_id = %s
-              AND ei.evidence_type = 'license'
+            WHERE ei.source_revision_id = %s
+              AND {IDENTIFIED_LICENSE}
             ORDER BY ei.id
             """,
-            (str(cv_id),),
+            (pinned_revision_id,),
         )
         licenses = tuple(
             LicenseEvidence(

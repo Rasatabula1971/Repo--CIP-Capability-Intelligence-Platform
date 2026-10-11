@@ -14,6 +14,13 @@ from db import migrate
 
 TABLES_IN_TRUNCATE_ORDER = [
     "evaluation",
+    "audit_event",
+    "approval",
+    "approval_request",
+    "decision_record",
+    "requirement_search",
+    "acceptance_criterion",
+    "requirement_need_link",
     "requirement_verification",
     "build_task_requirement",
     "build_task",
@@ -78,6 +85,18 @@ TABLES_IN_TRUNCATE_ORDER = [
 @pytest.fixture(scope="session", autouse=True)
 def _apply_migrations():
     migrate.up(for_tests=True)
+
+
+@pytest.fixture(autouse=True)
+def _wide_terminal(monkeypatch):
+    """
+    The CLI wraps every line it prints to the terminal's width. Under
+    pytest there is no terminal, so that would be 80 columns and every
+    assertion on a long line would be about wrapping. Tests that ARE
+    about wrapping set their own width.
+    """
+    from cip_composer import cli
+    monkeypatch.setattr(cli, "_terminal_width", lambda: 100_000)
 
 
 @pytest.fixture

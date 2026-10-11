@@ -30,14 +30,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from analysis.extractors import extractor_names as _extractor_names
+from core.pdr.text import WRAP_PREFIX, one_line, printable, wrap_block
 from db.connection import connect
 from mcp_server import queries
+from mcp_server import pdr_approvals
 from mcp_server import pdr_queries
+from mcp_server import pdr_store
 from mcp_server import eval_queries
 from scripts.compose.scaffold_pipeline import scaffold as _scaffold
 from scripts.compose.suggest_pipeline import (
@@ -51,7 +55,111 @@ from scripts.compose.suggest_pipeline import (
 # ---------------------------------------------------------------------------
 
 def _print_json(obj: Any) -> None:
-    print(json.dumps(obj, indent=2, default=str))
+    """
+    JSON is for a program to read, so it is not wrapped: a wrapped JSON
+    document does not parse. ensure_ascii (the default) escapes every
+    control character, so it is safe to print as it is.
+    """
+    text = json.dumps(obj, indent=2, default=str)
+    out = sys.stdout
+    if isinstance(out, _SafeStream):
+        out.write_unwrapped(text + "\n")
+    else:
+        print(text)
+
+
+class _SafeStream:
+    """
+    Standard output with everything that could mislead the person reading
+    it taken out. Much of what this CLI prints was written by someone else
+    — an agent's requirement text, a project name, a repository's display
+    name scraped from the internet — and a person may be about to act on
+    what they see. In one place, so no command has to remember to:
+
+      - escape sequences and other control characters are removed;
+      - with `wrap`, every line is wrapped here to the terminal's width,
+        and each continuation row starts with WRAP_PREFIX. Otherwise a
+        long value pushes whatever follows it onto a row of its own,
+        where it reads as a line CIP printed. A summary was wrapped; the
+        "Project: <name>" line under it was not, and a padded name put a
+        forged "PDR file: ... matches" row on the approval screen.
+    """
+
+    def __init__(self, stream, wrap: bool = False):
+        self._stream = stream
+        self._wrap = wrap
+        self._pending = ""
+
+    def _emit(self, line: str) -> None:
+        self._stream.write(wrap_block(line, _terminal_width()) if self._wrap else line)
+
+    def write(self, text):
+        if not isinstance(text, str):
+            return self._stream.write(text)
+        self._pending += printable(text)
+        *lines, self._pending = self._pending.split("\n")
+        for line in lines:
+            self._emit(line)
+            self._stream.write("\n")
+        return len(text)
+
+    def write_unwrapped(self, text: str) -> None:
+        self.flush()
+        self._stream.write(printable(text))
+
+    def flush(self):
+        # A prompt has no newline; it must still appear before the read.
+        if self._pending:
+            self._emit(self._pending)
+            self._pending = ""
+        return self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+# Commands a person reads to decide something, or that print text an agent
+# wrote. Their output is always wrapped, also when piped into a pager. The
+# rest are wrapped only when writing to a terminal, so `cip-composer find
+# ... | grep` still gets one row per line.
+_ALWAYS_WRAPPED = frozenset({
+    "cmd_pdr_status", "cmd_ingest_pdr", "cmd_record_requirements", "cmd_record_needs",
+    "cmd_confirm_requirements", "cmd_pdr_lock", "cmd_pdr_coverage",
+    "cmd_search_for_requirement", "cmd_record_decision", "cmd_check_against_lock",
+    "cmd_record_build_progress", "cmd_pdr_brief", "cmd_approvals_list",
+    "cmd_approvals_show", "cmd_approvals_approve", "cmd_approvals_reject", "cmd_verify",
+})
+
+
+def _terminal_width() -> int:
+    """
+    Columns to wrap to: the narrowest terminal attached to this process,
+    less one.
+
+    The terminal itself is asked. COLUMNS in the environment can be stale
+    or simply wrong, and a figure larger than the real width is the unsafe
+    direction: CIP would leave a line long and the terminal would wrap it.
+    All three standard streams are tried, so output piped into a pager is
+    still wrapped for the terminal the pager draws on. With no terminal
+    at all, 80: narrower than the real thing is harmless.
+    """
+    widths = []
+    for stream in (sys.__stdout__, sys.__stderr__, sys.__stdin__):
+        try:
+            widths.append(os.get_terminal_size(stream.fileno()).columns)
+        except (OSError, ValueError, AttributeError):
+            continue
+    columns = min(widths) if widths else 80
+    return max(len(WRAP_PREFIX) + 20, columns - 1)
+
+
+def _print_block(text: str) -> None:
+    """
+    Print a summary a person will decide on. The output stream wraps every
+    line it is given (see _SafeStream); this exists so the places that
+    print a summary say so.
+    """
+    print(text)
 
 
 def _print_row_table(rows: list[dict], columns: list[str]) -> None:
@@ -612,14 +720,115 @@ def cmd_list_adapters(args) -> int:
     return 0
 
 
+class _InputError(Exception):
+    """A problem with a file the user pointed the CLI at. Printed, not raised."""
+
+
+def _load_json_arg(path: str | None) -> Any:
+    """
+    Read a JSON file. Accepts UTF-8 with or without a byte-order mark and
+    UTF-16 with one (what PowerShell 5.1 writes with `>`).
+    """
+    if not path:
+        return None
+    try:
+        data = Path(path).read_bytes()
+    except OSError as e:
+        raise _InputError(f"could not read {path}: {e}") from None
+    encoding = "utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    try:
+        return json.loads(data.decode(encoding))
+    except UnicodeDecodeError:
+        raise _InputError(
+            f"{path} is not UTF-8 (or UTF-16 with a byte-order mark) text"
+        ) from None
+    except json.JSONDecodeError as e:
+        raise _InputError(f"{path} is not valid JSON: {e}") from None
+
+
+def _abs_path(path: str | None) -> str | None:
+    """
+    Absolute form of a document path given on the command line. The CLI
+    runs where the person is standing, so relative paths resolve from
+    there; the tool layer itself only accepts absolute paths.
+    """
+    return str(Path(path).expanduser().resolve()) if path else None
+
+
+def _gate_result(result: dict | None, missing: str) -> int | None:
+    """Shared handling for the three non-success shapes. None = carry on."""
+    if result is None:
+        print(missing)
+        return 1
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if result.get("refused"):
+        print(f"Refused: {result['reason']}")
+        return 1
+    return None
+
+
+def cmd_pdr_status(args) -> int:
+    conn = connect()
+    try:
+        is_id = pdr_store.is_uuid(args.project)
+        result = pdr_queries.pdr_status(
+            conn,
+            project_id=args.project if is_id else None,
+            project_name=None if is_id else args.project,
+        )
+    finally:
+        conn.close()
+    if result is None:
+        print("Project not found")
+        return 1
+    if args.json:
+        _print_json(result)
+        return 0
+    print(f"Project: {one_line(result['project_name'], 120)}  ({result['project_id']})")
+    print(f"Phase:   {result['phase']}")
+    req = result["requirements"]
+    print(f"Requirements: {len(req['items'])} recorded, confirmation: {req['confirmation']}")
+    for b in req["blockers"]:
+        print(f"  blocker: {one_line(b, 400)}")
+    for n in result["needs"]:
+        state = n["verdict"] or ("searched" if n["swept"] else "not searched")
+        print(f"  need {one_line(n['slug'], 100)}: {state}")
+    lock = result["lock"]
+    if lock:
+        usable = "usable" if lock["usable"] else "STALE"
+        print(f"Lock: v{lock['version']} approved by {one_line(lock['approved_by'], 120)} "
+              f"({usable})")
+        for r in lock["stale_reasons"]:
+            print(f"  stale: {one_line(r, 400)}")
+    else:
+        print("Lock: none")
+    for p in result["pending_approvals"]:
+        print(f"Awaiting your approval: {p['kind']}  {p['approval_request_id'][:8]}")
+    if result.get("obsolete_requests"):
+        print(f"Obsolete approval requests (overtaken by later edits): "
+              f"{result['obsolete_requests']}")
+    approved = result.get("approved_lock_request")
+    if approved:
+        print(f"Lock request {approved['approval_request_id'][:8]} is approved "
+              f"and not yet written.")
+    p = result["progress"]
+    print(f"Progress: {p['verified']}/{p['in_scope']} in-scope requirements verified "
+          f"({p['verified_cip_executed']} by CIP-executed tests)")
+    print("Next:")
+    for a in result["next_actions"]:
+        print(f"  - {one_line(a, 600)}")
+    return 0
+
+
 def cmd_ingest_pdr(args) -> int:
-    pdr_text = Path(args.file).read_text(encoding="utf-8")
     conn = connect()
     try:
         result = pdr_queries.ingest_pdr(
             conn, project_name=args.project_name,
             pdr_title=args.title or Path(args.file).stem,
-            pdr_text=pdr_text,
+            pdr_path=_abs_path(args.file),
             project_id=getattr(args, "project_id", None),
         )
     finally:
@@ -634,12 +843,14 @@ def cmd_ingest_pdr(args) -> int:
         print(f"Project:  {result['project_id']}")
         print(f"Source:   {result['requirement_source_id']}{dup}")
         print(f"Hash:     {result['content_hash'][:16]}...")
+        if result.get("orphaned"):
+            print("Orphaned requirements (quote not in the new text): "
+                  + ", ".join(result["orphaned"]))
     return 0
 
 
 def cmd_record_requirements(args) -> int:
-    reqs_text = Path(args.file).read_text(encoding="utf-8")
-    reqs = json.loads(reqs_text)
+    reqs = _load_json_arg(args.file)
     if isinstance(reqs, dict):
         reqs = reqs.get("requirements", [reqs])
     conn = connect()
@@ -663,30 +874,138 @@ def cmd_record_requirements(args) -> int:
             errs = "; ".join(r.get("errors", []))
             extra = f" — {errs}" if errs else ""
             print(f"  [{status}] {slug}{extra}")
-    return 0
+        cov = result.get("span_coverage")
+        if cov and cov["unmapped_sections"]:
+            print("PDR sections with no requirement mapped: "
+                  + ", ".join(one_line(s["heading"], 80) for s in cov["unmapped_sections"]))
+    # Exit status says whether everything was recorded, so a script (or an
+    # agent reading only the status) cannot take a refusal for success.
+    return 0 if all(r["valid"] for r in result["requirements"]) else 2
 
 
-def cmd_pdr_lock(args) -> int:
+def cmd_record_needs(args) -> int:
+    needs = _load_json_arg(args.file)
+    if isinstance(needs, dict):
+        needs = needs.get("needs", [needs])
     conn = connect()
     try:
-        result = pdr_queries.lock_architecture(
+        result = pdr_queries.record_capability_needs(
+            conn, project_id=args.project_id, needs=needs,
+        )
+    finally:
+        conn.close()
+    rc = _gate_result(result, "Project not found")
+    if rc is not None:
+        return rc
+    if args.json:
+        _print_json(result)
+    else:
+        for n in result["needs"]:
+            status = "OK" if n["valid"] else "INVALID"
+            notes = "; ".join(n.get("errors", []) + n.get("warnings", []))
+            print(f"  [{status}] {n.get('slug', '?')}" + (f" — {notes}" if notes else ""))
+        for b in result["blockers"]:
+            print(f"  blocker: {one_line(b, 400)}")
+    return 0 if all(n["valid"] for n in result["needs"]) else 2
+
+
+def cmd_confirm_requirements(args) -> int:
+    conn = connect()
+    try:
+        result = pdr_queries.request_requirements_confirmation(
             conn, project_id=args.project_id,
-            approved_by=args.by, approval_note=args.note,
         )
     finally:
         conn.close()
     if result is None:
         print("Project not found")
         return 1
-    if result.get("refused"):
-        print(f"Refused: {result['reason']}")
-        return 1
+    done = 0 if result["status"] in ("awaiting_approval", "approved") else 2
     if args.json:
         _print_json(result)
+        return done
+    print(f"Status: {result['status']}")
+    for b in result.get("blockers", []):
+        print(f"  blocker: {one_line(b, 400)}")
+    if result.get("approval_request_id"):
+        print(f"Approval request: {result['approval_request_id']}")
+    if result.get("how_to_approve"):
+        print(result["how_to_approve"])
+    return done
+
+
+_LOCK_INPUT_KEYS = ("approved_providers", "cost_commitments", "project_decisions",
+                    "unresolved_risks")
+
+
+def _lock_inputs(path: str | None) -> dict[str, Any]:
+    """
+    The --inputs file for pdr-lock and pdr-brief. A key this command does
+    not know is refused: `providers` instead of `approved_providers` used
+    to be dropped without a word, and the request then showed "none".
+    """
+    inputs = _load_json_arg(path) or {}
+    if not isinstance(inputs, dict):
+        raise _InputError("--inputs must be a JSON object")
+    unknown = sorted(k for k in inputs if k not in _LOCK_INPUT_KEYS)
+    if unknown:
+        raise _InputError(
+            f"--inputs has key(s) this command does not use: "
+            f"{', '.join(one_line(k, 40) for k in unknown)}. "
+            f"Allowed: {', '.join(_LOCK_INPUT_KEYS)}"
+        )
+    return inputs
+
+
+def cmd_pdr_lock(args) -> int:
+    inputs = _lock_inputs(args.inputs)
+    conn = connect()
+    try:
+        if args.approval_request:
+            if args.inputs or args.architecture_doc:
+                print("Error: --approval-request replays what was approved; "
+                      "do not pass --inputs or --architecture-doc with it")
+                return 1
+            result = pdr_queries.lock_architecture(
+                conn, project_id=args.project_id,
+                approval_request_id=args.approval_request,
+            )
+        else:
+            result = pdr_queries.lock_architecture(
+                conn, project_id=args.project_id,
+                architecture_doc_path=_abs_path(args.architecture_doc),
+                approved_providers=inputs.get("approved_providers"),
+                cost_commitments=inputs.get("cost_commitments"),
+                project_decisions=inputs.get("project_decisions"),
+                unresolved_risks=inputs.get("unresolved_risks"),
+            )
+    finally:
+        conn.close()
+    rc = _gate_result(result, "Project not found")
+    if rc is not None:
+        return rc
+    if args.json:
+        _print_json(result)
+    elif result.get("status") == "awaiting_approval":
+        _print_block(result["summary_markdown"])
+        print()
+        print(f"Awaiting approval: request {result['approval_request_id']}")
+        print(result["how_to_approve"])
+        print(f"Then: cip-composer pdr-lock {args.project_id} "
+              f"--approval-request {result['approval_request_id']}")
     else:
+        if result.get("unchanged"):
+            print("Nothing changed since the active lock.")
         print(f"Lock v{result['version']}: {result['architecture_lock_id']}")
         print(f"  Decisions: {result['decision_count']}")
-        print(f"  Hash: {result['source_lock_hash'][:16]}...")
+        print(f"  Approved by: {result['approved_by']}")
+        print(f"  Hash: {result['payload_hash'][:16]}...")
+        if result.get("tasks_abandoned"):
+            # Work the new lock does not include ends with it.
+            print(f"  Tasks abandoned (not carried by this lock): "
+                  f"{len(result['tasks_abandoned'])}")
+            for tid in result["tasks_abandoned"]:
+                print(f"    {one_line(tid, 60)}")
     return 0
 
 
@@ -702,12 +1021,39 @@ def cmd_pdr_coverage(args) -> int:
     if args.json:
         _print_json(result)
     else:
-        print(f"Project: {result['project_name']}")
-        print(f"  Requirements: {result['total_requirements']}")
-        print(f"  Decided:      {result['decided']}")
-        print(f"  Tasked:       {result['tasked']}")
-        print(f"  Implemented:  {result['implemented']}")
-        print(f"  Verified:     {result['verified']}")
+        p, pdr, needs = result["progress"], result["pdr"], result["needs"]
+        print(f"Project: {one_line(result['project_name'], 120)}")
+        if pdr["section_count"] is not None:
+            print(f"  PDR sections mapped: {pdr['mapped_section_count']}/{pdr['section_count']}")
+        print(f"  Requirements: {result['requirements']['total']} "
+              f"({p['in_scope']} in scope)")
+        print(f"  Needs:        {needs['decided']}/{needs['total']} decided, "
+              f"registry answered {needs['registry_answered_pct']}%")
+        print(f"  Decided:      {p['decided']}")
+        print(f"  Locked:       {p['locked']}")
+        print(f"  Tasked:       {p['tasked']}")
+        print(f"  Implemented:  {p['implemented']}")
+        print(f"  Verified:     {p['verified']} "
+              f"({p['verified_cip_executed']} CIP-executed, "
+              f"{p['verified_agent_reported_only']} agent-reported)")
+        c = result["compliance"]
+        if c["tasks_worked_without_lock_check"]:
+            print(f"  Tasks worked with no lock check on record: "
+                  f"{c['tasks_worked_without_lock_check']}")
+        # What was actually run for each CIP-executed pass, and where. The
+        # count above says a command exited 0; these lines say which
+        # command, at which commit, in which repository.
+        runs = [(r["slug"], e) for r in result["by_requirement"] for e in r["evidence"]
+                if e.get("recorded_by") == "cip_executed" and e.get("outcome") == "pass"]
+        if runs:
+            print("  CIP-executed passes (check the command tests the criterion, and "
+                  "that the repository is this project's):")
+            for slug, e in runs:
+                print(f"    {one_line(slug, 80)} #{e['criterion_ordinal']}: "
+                      f"{one_line(e.get('command'), 200)}")
+                print(f"      at {one_line(e.get('commit_sha'), 40)} in "
+                      f"{one_line(e.get('evidence_ref'), 200) or 'repository not recorded'}"
+                      + (" (working tree dirty)" if e.get("worktree_dirty") else ""))
     return 0
 
 
@@ -726,22 +1072,30 @@ def cmd_search_for_requirement(args) -> int:
         )
     finally:
         conn.close()
-    if result is None:
-        print("Requirement not found")
-        return 1
+    rc = _gate_result(result, "Capability need not found")
+    if rc is not None:
+        return rc
     if args.json:
         _print_json(result)
     else:
-        print(f"Requirement: {result['slug']} — {result['description']}")
-        if result["constraints"]:
-            print(f"Constraints: {len(result['constraints'])}")
-        print(f"Search query: {result.get('search_query', '(none)')}")
-        print(f"Candidates found: {result['candidate_count']}")
+        # Every value below is stored text; each is printed as ONE line.
+        v = one_line
+        print(f"Need: {v(result['slug'])} — {v(result['description'])}")
+        print(f"Queries: {', '.join(v(x) for x in result['queries'])}"
+              + ("" if result["counts_as_mandatory_sweep"] else "  (extra search, not the sweep)"))
+        print(f"Registry size: {result['registry_size']}  coverage: {result['coverage_outcome']}")
+        print(f"Candidates evaluated: {result['candidate_count']}")
         for c in result["candidates"]:
             score = f"fit={c['fit_score']:.3f}"
             gaps = f"gaps={c['blocking_gap_count']}"
-            intrinsic = f"score={c['intrinsic_score']:.3f}" if c['intrinsic_score'] else "score=n/a"
-            print(f"  {c['display_name']} ({c['ecosystem']}) — {score}, {gaps}, {intrinsic}")
+            intrinsic = (f"score={c['intrinsic_score']:.3f}"
+                         if c["intrinsic_score"] is not None else "score=n/a")
+            print(f"  {v(c['display_name'])} ({v(c['ecosystem'])}) — {score}, {gaps}, {intrinsic}")
+        for u in result["unevaluable"]:
+            print(f"  not selectable: {v(u['normalized_key'])} — {v(u['reason'])}")
+        for m in result["evaluation_matches"]:
+            print(f"  banked evaluation: {v(m['asset_slug'])} [{v(m['verdict'])}, "
+                  f"{v(m['evidence_depth'])}, {v(m['match'])} match]")
     return 0
 
 
@@ -750,31 +1104,50 @@ def cmd_record_decision(args) -> int:
     try:
         result = pdr_queries.record_decision(
             conn, req_id=args.req_id,
-            verdict=args.verdict.upper(),
+            verdict=args.verdict.upper() if args.verdict else None,
             chosen_capability_version_id=args.capability_version_id,
             rationale=args.rationale or "",
         )
     finally:
         conn.close()
-    if result is None:
-        print("Requirement not found")
-        return 1
-    if result.get("refused"):
-        print(f"Refused: {result['reason']}")
-        return 1
+    rc = _gate_result(result, "Capability need not found")
+    if rc is not None:
+        return rc
     if args.json:
         _print_json(result)
     else:
-        print(f"Recorded: {result['verdict']} → recommendation {result['recommendation_id']}")
+        print(f"Recorded: {result['verdict']} for {result['need']} "
+              f"(decided by {result['decided_by']})")
+        if result["flags"]:
+            print(f"  flags: {', '.join(result['flags'])}")
     return 0
 
 
 def cmd_check_against_lock(args) -> int:
-    proposed = {"description": args.description or ""}
-    if args.capability_version_id:
-        proposed["capability_version_id"] = args.capability_version_id
+    proposed = _load_json_arg(args.change) or {}
+    if not isinstance(proposed, dict):
+        print("Error: --change must be a JSON object")
+        return 1
+    if args.description:
+        proposed["description"] = args.description
+    if args.task:
+        proposed["build_task_id"] = args.task
+    if args.path:
+        proposed["changed_paths"] = list(args.path)
     if args.provider:
-        proposed["provider"] = args.provider
+        proposed["provider_changes"] = [{"name": p, "action": "add"} for p in args.provider]
+    if args.dependency:
+        deps = []
+        for d in args.dependency:
+            eco, _, name = d.partition(":")
+            deps.append({"ecosystem": eco, "name": name})
+        proposed["dependency_adds"] = deps
+    if args.project_decision:
+        changes = []
+        for d in args.project_decision:
+            key, _, choice = d.partition("=")
+            changes.append({"key": key.strip(), "choice": choice.strip()})
+        proposed["project_decision_changes"] = changes
 
     conn = connect()
     try:
@@ -790,22 +1163,17 @@ def cmd_check_against_lock(args) -> int:
     if args.json:
         _print_json(result)
     else:
-        print(f"Verdict: {result['verdict']}")
-        print(f"Reason: {result['reason']}")
-    return 0
+        print(f"Verdict: {one_line(result['verdict'])}")
+        for r in result["reasons"]:
+            print(f"  - {one_line(r)}")
+    return 0 if result["verdict"] == "allowed" else 2
 
 
 def cmd_record_build_progress(args) -> int:
     conn = connect()
     try:
         if args.build_task_id:
-            verification = None
-            if args.verify_req_id and args.verify_outcome:
-                verification = {
-                    "req_id": args.verify_req_id,
-                    "outcome": args.verify_outcome,
-                    "evidence_ref": args.verify_evidence,
-                }
+            verification = _load_json_arg(args.verification)
             result = pdr_queries.record_build_progress(
                 conn,
                 build_task_id=args.build_task_id,
@@ -814,7 +1182,7 @@ def cmd_record_build_progress(args) -> int:
                 verification=verification,
             )
         else:
-            req_ids = [r.strip() for r in args.req_ids.split(",")]
+            req_ids = [r.strip() for r in (args.req_ids or "").split(",") if r.strip()]
             result = pdr_queries.record_build_progress(
                 conn,
                 project_id=args.project_id,
@@ -822,6 +1190,8 @@ def cmd_record_build_progress(args) -> int:
                 title=args.title,
                 objective=args.objective,
                 req_ids=req_ids,
+                permitted_paths=list(args.permitted_path or []),
+                reused_capability_version_id=args.reused_capability_version_id,
             )
     finally:
         conn.close()
@@ -839,19 +1209,353 @@ def cmd_record_build_progress(args) -> int:
 
 
 def cmd_pdr_brief(args) -> int:
+    inputs = _lock_inputs(args.inputs)
     conn = connect()
     try:
-        result = pdr_queries.build_approval_brief(conn, project_id=args.project_id)
+        result = pdr_queries.build_approval_brief(
+            conn, project_id=args.project_id,
+            architecture_doc_path=_abs_path(args.architecture_doc),
+            approved_providers=inputs.get("approved_providers"),
+            cost_commitments=inputs.get("cost_commitments"),
+            project_decisions=inputs.get("project_decisions"),
+            unresolved_risks=inputs.get("unresolved_risks"),
+        )
     finally:
         conn.close()
     if result is None:
         print("Project not found")
         return 1
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
     if args.json:
         _print_json(result)
     else:
-        print(result["brief_markdown"])
+        _print_block(result["brief_markdown"])
+        for u in result["unresolved"]:
+            print(f"BLOCKER: {one_line(u, 400)}")
+    return 0 if not result.get("unresolved") else 2
+
+
+# ---------------------------------------------------------------------------
+# Human approvals
+#
+# These are the only code paths that record a human decision. They demand an
+# interactive terminal and a typed confirmation code, so an approval cannot
+# happen as a side effect of an agent running a command. This is governed
+# cooperation, not a sandbox: an agent with a shell that sets out to defeat
+# it can. Do not ask an agent to run these.
+# ---------------------------------------------------------------------------
+
+def _human_identity() -> str:
+    """
+    Who is at the keyboard, as the operating system reports it.
+
+    os.getlogin() asks the OS (the controlling terminal's login on POSIX,
+    GetUserName on Windows). getpass.getuser() is only the fallback: it
+    reads LOGNAME / USER / USERNAME first, which anything in the
+    environment can set.
+    """
+    import getpass
+    import os
+    import socket
+    user = None
+    try:
+        user = os.getlogin()
+    except OSError:
+        try:
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            try:
+                user = getpass.getuser()
+            except Exception:
+                user = None
+    return f"{one_line(user or 'unknown', 80)}@{one_line(socket.gethostname(), 120)}"
+
+
+def _require_interactive() -> str | None:
+    """None if a human is at a terminal, else why not."""
+    try:
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    if not interactive:
+        return (
+            "Approvals must be given by a person at an interactive terminal. "
+            "This session is not interactive, so nothing was recorded."
+        )
+    return None
+
+
+def _ask(prompt: str) -> str | None:
+    """
+    One typed line, or None if there is nobody to type it. On Windows the
+    NUL device reports itself as a terminal, so isatty() alone is not
+    enough: a read that hits end-of-input is treated as "no human".
+    """
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def _print_request(req: dict[str, Any]) -> None:
+    """Everything a person should read before deciding a request."""
+    _print_block(req["summary"])
+    print()
+    print(f"Request:  {req['id']}")
+    print(f"Project:  {one_line(req['project_name'], 120)}")
+    print(f"Kind:     {req['kind']}")
+    print(f"Content:  {req['subject_hash'][:16]}")
+    print(f"State:    {req['state']}"
+          + (f" by {one_line(req['approver'], 120)}" if req.get("approver") else ""))
+    if req.get("source_check"):
+        print(f"PDR file: {one_line(req['source_check'], 400)}")
+    if req.get("doc_check"):
+        print(f"Architecture document: {one_line(req['doc_check'], 400)}")
+    if req.get("obsolete_reason"):
+        print(f"OBSOLETE: {one_line(req['obsolete_reason'], 400)}")
+
+
+def cmd_approvals_list(args) -> int:
+    conn = connect()
+    try:
+        rows = pdr_approvals.list_requests(
+            conn, state=None if args.all else "pending",
+        )
+        for r in rows:
+            r["obsolete_reason"] = pdr_queries.request_obsolete_reason(conn, r)
+    finally:
+        conn.close()
+    if args.json:
+        _print_json(rows)
+        return 0
+    if not rows:
+        print("No approval requests." if args.all else "Nothing is waiting for approval.")
+        return 0
+    _print_row_table(
+        [{"id": r["id"][:8],
+          "project_name": one_line(r["project_name"], 40),
+          "kind": r["kind"],
+          "state": r["state"] + (" (obsolete)" if r["obsolete_reason"] else ""),
+          "requested_at": r["requested_at"][:16]} for r in rows],
+        ["id", "project_name", "kind", "state", "requested_at"],
+    )
     return 0
+
+
+def cmd_approvals_show(args) -> int:
+    conn = connect()
+    try:
+        req = pdr_queries.describe_request(conn, args.request_id)
+    finally:
+        conn.close()
+    if req is None:
+        print("Approval request not found (give at least 6 characters of its id; "
+              "a prefix must match exactly one request).")
+        return 1
+    if args.json:
+        _print_json(req)
+        return 0
+    _print_request(req)
+    return 0
+
+
+def _decide(args, outcome: str) -> int:
+    problem = _require_interactive()
+    if problem:
+        print(problem)
+        return 3
+    conn = connect()
+    try:
+        req = pdr_queries.describe_request(conn, args.request_id)
+        if req is None:
+            print("Approval request not found (give at least 6 characters of its id; "
+                  "a prefix must match exactly one request).")
+            return 1
+        if req["state"] != "pending":
+            print(f"Already {req['state']} by {one_line(req['approver'], 120)}.")
+            return 1
+        _print_request(req)
+        print()
+        if req.get("obsolete_reason"):
+            print("This request has been overtaken and cannot be decided. "
+                  "Ask for a fresh one.")
+            return 1
+        code = req["subject_hash"][:6]
+        verb = "APPROVE" if outcome == "approved" else "REJECT"
+        print(f"You are about to {verb} this {req['kind'].replace('_', ' ')} "
+              f"for project '{one_line(req['project_name'], 120)}'.")
+        typed = _ask(f"Type the content code {code} to confirm: ")
+        if typed is None:
+            print("No input was available. Nothing was recorded.")
+            return 3
+        if typed != code:
+            print("Code did not match. Nothing was recorded.")
+            return 1
+        note = args.note
+        if outcome == "rejected" and not note:
+            note = _ask("What needs to change? ")
+        # The summary was on screen for as long as it took to read. Look
+        # again before recording: record_approval checks the request's
+        # place in history, not whether a decision or the scope moved under
+        # it while the person was reading.
+        conn.rollback()
+        now = pdr_queries.describe_request(conn, req["id"])
+        if now is None or now["state"] != "pending" or now.get("obsolete_reason"):
+            why = (now or {}).get("obsolete_reason") or "it has already been decided"
+            print(f"The project changed while this was on screen: {one_line(why, 400)}.")
+            print("Nothing was recorded. Ask for a fresh request.")
+            return 1
+        result = pdr_approvals.record_approval(
+            conn, request_id=req["id"], outcome=outcome,
+            approver=_human_identity(), note=note,
+        )
+    finally:
+        conn.close()
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    print(f"Recorded: {result['outcome']} by {result['approver']}.")
+    return 0
+
+
+def cmd_approvals_approve(args) -> int:
+    return _decide(args, "approved")
+
+
+def cmd_approvals_reject(args) -> int:
+    return _decide(args, "rejected")
+
+
+def _decode_output(data: bytes) -> str:
+    """Test output for display only. Never fails: the digest is over the bytes."""
+    return (data or b"").decode("utf-8", errors="replace")
+
+
+def cmd_verify(args) -> int:
+    """
+    Run an acceptance test and record what CIP itself observed.
+
+    The command runs in the current directory (the target repo), without
+    a shell. CIP records the exit code, a digest of the raw output, the
+    commit and whether the working tree was dirty, as a `cip_executed`
+    verification.
+
+    What that proves is narrow and worth saying plainly: this command
+    exited 0 here, at this commit. It does not prove the command tests
+    the criterion. A run on a dirty tree is recorded but does not count
+    as CIP-executed in coverage, because the code that ran is not the
+    code at the commit.
+    """
+    import hashlib
+    import shutil
+    import subprocess
+
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("Error: give the test command after --")
+        return 1
+
+    def git(*argv: str) -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", *argv], capture_output=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return _decode_output(out.stdout).strip() if out.returncode == 0 else None
+
+    commit = git("rev-parse", "HEAD")
+    if not commit:
+        print("Error: not inside a git repository with a commit; "
+              "a verification must name the commit it ran against.")
+        return 1
+    status = git("status", "--porcelain")
+    if status is None:
+        print("Error: could not read the working tree state from git.")
+        return 1
+    dirty = bool(status)
+
+    # Resolve the program the way a shell would (PATHEXT on Windows, so a
+    # .cmd / .bat shim such as npm or pytest is found) without using one.
+    program = shutil.which(command[0])
+    if program is None:
+        print(f"Error: could not find the program '{one_line(command[0], 200)}' on PATH")
+        return 1
+
+    try:
+        proc = subprocess.run(
+            [program, *command[1:]], capture_output=True, timeout=args.timeout,
+        )
+        exit_code = proc.returncode
+        raw = (proc.stdout or b"") + (proc.stderr or b"")
+    except subprocess.TimeoutExpired:
+        exit_code, raw = 124, f"timed out after {args.timeout}s".encode()
+    except OSError as e:
+        print(f"Error: could not run the command: {e}")
+        return 1
+    output = _decode_output(raw)
+
+    # Look again. A command that edits tracked files (a formatter, a
+    # snapshot update, a build step) leaves the tree dirty behind it, and
+    # what it tested was then not the commit either.
+    after = git("status", "--porcelain")
+    if after is None or after:
+        dirty = True
+    repo_root = git("rev-parse", "--show-toplevel")
+
+    verification = {
+        "outcome": "pass" if exit_code == 0 else "fail",
+        "commit_sha": commit,
+        "test_ref": args.test_ref or " ".join(command),
+        "command": " ".join(command),
+        "exit_code": exit_code,
+        "output_digest": hashlib.sha256(raw).hexdigest(),
+        "worktree_dirty": dirty,
+        # Which repository this ran in. The commit alone does not say.
+        "evidence_ref": f"repo:{one_line(repo_root, 400)}" if repo_root else None,
+    }
+    if pdr_store.is_uuid(args.criterion):
+        verification["criterion_id"] = args.criterion
+    else:
+        if not args.req or not (args.criterion.isascii() and args.criterion.isdigit()):
+            print("Error: --criterion takes a criterion id, or an ordinal together with --req")
+            return 1
+        verification["req_id"] = args.req
+        verification["criterion_ordinal"] = int(args.criterion)
+
+    conn = connect()
+    try:
+        result = pdr_queries.record_executed_verification(
+            conn, build_task_id=args.task, verification=verification,
+        )
+    finally:
+        conn.close()
+    if result.get("error"):
+        print(f"Error: {result['error']}")
+        return 1
+    if args.json:
+        _print_json({**result, "exit_code": exit_code, "commit_sha": commit,
+                     "worktree_dirty": dirty, "repository": repo_root})
+    else:
+        tail = "\n".join(printable(output).strip().splitlines()[-15:])
+        if tail:
+            print(tail)
+        print(f"{result['outcome'].upper()}: {one_line(result['requirement'])} "
+              f"#{result['criterion_ordinal']} at {commit[:12]}"
+              + (" (working tree dirty)" if dirty else "")
+              + (f" in {one_line(repo_root, 200)}" if repo_root else ""))
+        if dirty and exit_code == 0:
+            print("  The working tree has uncommitted changes, so this pass is recorded "
+                  "but does not count as CIP-executed. Commit and run it again.")
+        for r in result.get("remaining", []):
+            print(f"  still unverified: {one_line(r)}")
+    return 0 if exit_code == 0 else 2
 
 
 def cmd_fair_extract(args) -> int:
@@ -966,6 +1670,7 @@ def cmd_eval_record(args) -> int:
             license_notes=payload.get("license_notes", ""),
             cip_status=payload.get("cip_status", "not-ingested"),
             evaluated_at=payload.get("evaluated_at"),
+            evidence_depth=payload.get("evidence_depth"),
         )
     finally:
         conn.close()
@@ -1260,8 +1965,14 @@ def _build_parser() -> argparse.ArgumentParser:
     la.add_argument("--json", action="store_true")
     la.set_defaults(func=cmd_list_adapters)
 
+    ps = subs.add_parser("pdr-status",
+                          help="Where a PDR project is and what is allowed next.")
+    ps.add_argument("project", help="Project UUID or name.")
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=cmd_pdr_status)
+
     ip = subs.add_parser("ingest-pdr", help="Ingest a PDR document into a project.")
-    ip.add_argument("file", help="Path to the PDR text file.")
+    ip.add_argument("file", help="Path to the PDR document (.md, .markdown, .txt, .rst).")
     ip.add_argument("--project-name", dest="project_name", required=True,
                      help="Project name (created if new).")
     ip.add_argument("--title", default=None, help="PDR title (defaults to filename).")
@@ -1278,10 +1989,31 @@ def _build_parser() -> argparse.ArgumentParser:
     rr.add_argument("--json", action="store_true")
     rr.set_defaults(func=cmd_record_requirements)
 
-    pl = subs.add_parser("pdr-lock", help="Lock the architecture for a project.")
+    rn = subs.add_parser("record-needs",
+                          help="Record capability needs and link them to requirements.")
+    rn.add_argument("project_id", help="UUID of the project.")
+    rn.add_argument("file", help="JSON file with a needs array.")
+    rn.add_argument("--json", action="store_true")
+    rn.set_defaults(func=cmd_record_needs)
+
+    cr = subs.add_parser("confirm-requirements",
+                          help="Open (or report on) the requirements confirmation request.")
+    cr.add_argument("project_id", help="UUID of the project.")
+    cr.add_argument("--json", action="store_true")
+    cr.set_defaults(func=cmd_confirm_requirements)
+
+    pl = subs.add_parser("pdr-lock",
+                          help="Request, or complete, an architecture lock. "
+                               "Approval is given separately with `approvals approve`.")
     pl.add_argument("project_id", help="UUID of the project.")
-    pl.add_argument("--by", dest="by", required=True, help="Who is approving.")
-    pl.add_argument("--note", default=None, help="Approval note.")
+    pl.add_argument("--architecture-doc", dest="architecture_doc", default=None,
+                     help="Path to the architecture document.")
+    pl.add_argument("--inputs", default=None,
+                     help="JSON file with approved_providers, cost_commitments, "
+                          "project_decisions, unresolved_risks.")
+    pl.add_argument("--approval-request", dest="approval_request", default=None,
+                     help="Write the lock from this approved request (second call). "
+                          "Replays exactly what was approved.")
     pl.add_argument("--json", action="store_true")
     pl.set_defaults(func=cmd_pdr_lock)
 
@@ -1290,16 +2022,20 @@ def _build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--json", action="store_true")
     pc.set_defaults(func=cmd_pdr_coverage)
 
-    pb = subs.add_parser("pdr-brief", help="Render the approval brief for a project.")
+    pb = subs.add_parser("pdr-brief", help="Preview what the lock would freeze.")
     pb.add_argument("project_id", help="UUID of the project.")
+    pb.add_argument("--architecture-doc", dest="architecture_doc", default=None)
+    pb.add_argument("--inputs", default=None,
+                     help="JSON file, same shape as for pdr-lock.")
     pb.add_argument("--json", action="store_true")
     pb.set_defaults(func=cmd_pdr_brief)
 
     sr = subs.add_parser("search-for-requirement",
-                          help="Search registry and compute fit for a requirement.")
-    sr.add_argument("req_id", help="UUID of the project_requirement.")
+                          help="Search registry and evaluation store for a capability need.")
+    sr.add_argument("req_id", help="UUID of the capability need.")
     sr.add_argument("--query", default=None,
-                     help="Search query (defaults to requirement description).")
+                     help="Extra query text. Omit it (and all filters) to run "
+                          "the mandatory sweep of the need's own search terms.")
     sr.add_argument("--ecosystem", default=None)
     sr.add_argument("--capability-kind", dest="capability_kind", default=None)
     sr.add_argument("--kind", default=None, help="Filter by component_kind.")
@@ -1310,9 +2046,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sr.set_defaults(func=cmd_search_for_requirement)
 
     rd = subs.add_parser("record-decision",
-                          help="Record a reuse/build verdict for a requirement.")
-    rd.add_argument("req_id", help="UUID of the project_requirement.")
-    rd.add_argument("verdict", help="ADOPT, ADAPT, WRAP, REFERENCE, REJECT, or BUILD.")
+                          help="Record the decision for a capability need. "
+                               "Omit the verdict to take the one CIP computes.")
+    rd.add_argument("req_id", help="UUID of the capability need.")
+    rd.add_argument("verdict", nargs="?", default=None,
+                     help="Proposed verdict: ADOPT, ADAPT, WRAP, REFERENCE or BUILD.")
     rd.add_argument("--capability-version-id", dest="capability_version_id", default=None,
                      help="Required for ADOPT/ADAPT/WRAP/REFERENCE.")
     rd.add_argument("--rationale", default=None, help="Free-text reason.")
@@ -1323,8 +2061,19 @@ def _build_parser() -> argparse.ArgumentParser:
                                help="Check a proposed change against the architecture lock.")
     ca_lock.add_argument("project_id", help="UUID of the project.")
     ca_lock.add_argument("--description", default=None, help="Description of the change.")
-    ca_lock.add_argument("--capability-version-id", dest="capability_version_id", default=None)
-    ca_lock.add_argument("--provider", default=None, help="Provider name to check.")
+    ca_lock.add_argument("--task", default=None, help="Build task UUID (needed with --path).")
+    ca_lock.add_argument("--path", action="append", default=None,
+                          help="A repo-relative path the change touches. Repeatable.")
+    ca_lock.add_argument("--provider", action="append", default=None,
+                          help="An external provider the change would add. Repeatable.")
+    ca_lock.add_argument("--dependency", action="append", default=None,
+                          help="A dependency the change would add, as ecosystem:name. Repeatable.")
+    ca_lock.add_argument("--project-decision", dest="project_decision", action="append",
+                          default=None,
+                          help="A cross-cutting decision the change would alter, "
+                               "as key=choice. Repeatable.")
+    ca_lock.add_argument("--change", default=None,
+                          help="JSON file with a full proposed_change object.")
     ca_lock.add_argument("--json", action="store_true")
     ca_lock.set_defaults(func=cmd_check_against_lock)
 
@@ -1335,22 +2084,56 @@ def _build_parser() -> argparse.ArgumentParser:
     bp.add_argument("--project-id", dest="project_id", default=None,
                      help="UUID of project (create mode).")
     bp.add_argument("--lock-id", dest="lock_id", default=None,
-                     help="UUID of architecture_lock (create mode).")
+                     help="UUID of the active architecture_lock (optional; create mode).")
     bp.add_argument("--title", default=None, help="Task title (create mode).")
     bp.add_argument("--objective", default=None, help="Task objective (create mode).")
     bp.add_argument("--req-ids", dest="req_ids", default=None,
-                     help="Comma-separated requirement UUIDs (create mode).")
+                     help="Comma-separated requirement/need slugs or UUIDs (create mode).")
+    bp.add_argument("--permitted-path", dest="permitted_path", action="append", default=None,
+                     help="A path the task may touch (create mode). Repeatable; required.")
+    bp.add_argument("--reused-capability-version-id", dest="reused_capability_version_id",
+                     default=None, help="Locked capability version this task integrates.")
     bp.add_argument("--status", default=None,
                      help="New status (update mode): planned/in_progress/implemented/verified/abandoned.")
     bp.add_argument("--target-commit", dest="target_commit", default=None)
-    bp.add_argument("--verify-req-id", dest="verify_req_id", default=None,
-                     help="Requirement UUID to verify (update mode).")
-    bp.add_argument("--verify-outcome", dest="verify_outcome", default=None,
-                     help="Verification outcome: pass/fail/not_run.")
-    bp.add_argument("--verify-evidence", dest="verify_evidence", default=None,
-                     help="Evidence reference for verification.")
+    bp.add_argument("--verification", default=None,
+                     help="JSON file with a verification object or list (update mode).")
     bp.add_argument("--json", action="store_true")
     bp.set_defaults(func=cmd_record_build_progress)
+
+    apr = subs.add_parser("approvals",
+                           help="HUMAN ONLY: review and decide approval requests.")
+    apr_subs = apr.add_subparsers(dest="approvals_cmd", required=True)
+    apr_l = apr_subs.add_parser("list", help="Requests waiting for approval.")
+    apr_l.add_argument("--all", action="store_true", help="Include decided requests.")
+    apr_l.add_argument("--json", action="store_true")
+    apr_l.set_defaults(func=cmd_approvals_list)
+    apr_s = apr_subs.add_parser("show", help="Show exactly what is being approved.")
+    apr_s.add_argument("request_id", help="Request UUID or a unique prefix.")
+    apr_s.add_argument("--json", action="store_true")
+    apr_s.set_defaults(func=cmd_approvals_show)
+    apr_a = apr_subs.add_parser("approve", help="Approve a request (interactive terminal only).")
+    apr_a.add_argument("request_id", help="Request UUID or a unique prefix.")
+    apr_a.add_argument("--note", default=None)
+    apr_a.set_defaults(func=cmd_approvals_approve)
+    apr_r = apr_subs.add_parser("reject", help="Reject a request (interactive terminal only).")
+    apr_r.add_argument("request_id", help="Request UUID or a unique prefix.")
+    apr_r.add_argument("--note", default=None, help="What needs to change.")
+    apr_r.set_defaults(func=cmd_approvals_reject)
+
+    vf = subs.add_parser("verify",
+                          help="Run an acceptance test here and record the result as CIP-executed.")
+    vf.add_argument("--task", required=True, help="Build task UUID.")
+    vf.add_argument("--criterion", required=True,
+                     help="Acceptance criterion UUID, or its ordinal together with --req.")
+    vf.add_argument("--req", default=None, help="Requirement slug or UUID (with an ordinal).")
+    vf.add_argument("--test-ref", dest="test_ref", default=None,
+                     help="Test identifier, e.g. tests/test_auth.py::test_login.")
+    vf.add_argument("--timeout", type=int, default=600)
+    vf.add_argument("--json", action="store_true")
+    vf.add_argument("command", nargs=argparse.REMAINDER,
+                     help="The test command, after --.")
+    vf.set_defaults(func=cmd_verify)
 
     fe = subs.add_parser("fair-extract",
                           help="Use FAIR to extract requirements from a PDR.")
@@ -1408,9 +2191,30 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A Windows console, or output piped through one, is often cp1252.
+    # Printing a character it cannot encode must not crash the command.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = _build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    import contextlib
+    try:
+        to_terminal = sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        to_terminal = False
+    wrap = to_terminal or getattr(args.func, "__name__", "") in _ALWAYS_WRAPPED
+    safe = _SafeStream(sys.stdout, wrap=wrap)
+    with contextlib.redirect_stdout(safe):
+        try:
+            return args.func(args)
+        except _InputError as e:
+            print(f"Error: {e}")
+            return 1
+        finally:
+            safe.flush()
 
 
 if __name__ == "__main__":

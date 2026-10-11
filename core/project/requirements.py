@@ -148,6 +148,22 @@ _VALID_CONSTRAINT_KINDS = frozenset({
     "forbidden_dependency",
 })
 
+# Public name for the set of constraint kinds that have a fit matcher in
+# core.project.fit. A requirement with none of these cannot be fit-scored
+# in any meaningful way — fit_score is 1.0 for every candidate.
+MATCHED_CONSTRAINT_KINDS = _VALID_CONSTRAINT_KINDS
+
+
+def parse_constraint(slug: str, index: int, raw: Any) -> dict[str, Any]:
+    """
+    Validate one constraint mapping and return {kind, detail}.
+
+    Public wrapper so callers outside the YAML importer (the PDR
+    workflow) validate constraints the same way. Raises
+    RequirementParseError on a malformed constraint.
+    """
+    return _parse_constraint(slug, index, raw)
+
 
 def _parse_constraint(
     slug: str, index: int, raw: Any,
