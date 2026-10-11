@@ -248,10 +248,17 @@ rest of CIP.
   behind a sync API and maps `SolveResponse` onto `FairResponse`. Builds
   a fresh `FAIR` per call (its httpx clients are event-loop-bound) and
   hops to a worker thread when invoked from inside a running loop, which
-  is how FastMCP calls sync tools. Provider keys come from
-  `GEMINI_API_KEY` / `GROQ_API_KEY` / `OPENROUTER_API_KEY` /
-  `OLLAMA_ENABLED` (and any other provider key FAIR itself reads from the
-  environment); `FAIR_CLIENT_ID` tags requests (default `cip`).
+  is how FastMCP calls sync tools. FAIR reads its provider keys from the
+  environment. `OPENROUTER_API_KEY`, `KILO_API_KEY` and local Ollama
+  (`OLLAMA_ENABLED`) work on their own. `GEMINI_API_KEY`, `GROQ_API_KEY`,
+  `MISTRAL_API_KEY` and `CLOUDFLARE_API_TOKEN` are recurring free-plan
+  accounts: FAIR uses one only when its provider id is listed in
+  `FAIR_CONFIRMED_FREE_PROVIDERS`, which is the operator's statement that
+  the account cannot be billed. FAIR's service reads that variable; its
+  embedded constructor does not, so `FairClient` passes it through.
+  `fair-status` lists what FAIR is using, what it skipped and why, and
+  says so when a key is set for a provider nobody has confirmed.
+  `FAIR_CLIENT_ID` tags requests (default `cip`).
   Output budget is capped at 4096 tokens because the Groq, OpenRouter
   and Ollama adapters reject anything larger.
 - `integrations/fair_pdr.py` — three driver functions using

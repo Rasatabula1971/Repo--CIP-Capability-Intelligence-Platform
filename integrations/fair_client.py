@@ -5,11 +5,22 @@ Wraps the embeddable `fair` module to route AI inference through free,
 quality-verified models (Gemini, Groq, OpenRouter free tier, Ollama).
 FAIR is an optional dependency: install with `pip install "cip[fair]"`.
 
-Configuration via environment variables (at least one provider required):
-  GEMINI_API_KEY       — Google Gemini free tier
-  GROQ_API_KEY         — Groq free plan
-  OPENROUTER_API_KEY   — OpenRouter, free models only
-  OLLAMA_ENABLED=1     — local Ollama (OLLAMA_URL defaults to 127.0.0.1:11434)
+Configuration via environment variables (at least one usable provider):
+  OPENROUTER_API_KEY   — OpenRouter, free models only. Works on its own
+  KILO_API_KEY         — Kilo, free models only. Works on its own
+  OLLAMA_ENABLED=1     — local Ollama (OLLAMA_URL defaults to 127.0.0.1:11434);
+                         needs the daemon running with a chat model pulled
+  GEMINI_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY, CLOUDFLARE_API_TOKEN
+                       — recurring free-plan accounts. A key alone is NOT
+                         enough: FAIR will not use one until its provider
+                         id is listed in FAIR_CONFIRMED_FREE_PROVIDERS
+  FAIR_CONFIRMED_FREE_PROVIDERS
+                       — comma-separated provider ids (google_gemini_api,
+                         groq, mistral, cloudflare_workers_ai). Listing one
+                         is your statement that the account behind its key
+                         cannot be billed. FAIR reads this for its own
+                         service; the embedded module does not, so CIP
+                         passes it through here
   FAIR_CLIENT_ID       — client identifier (default: cip)
 """
 from __future__ import annotations
@@ -25,6 +36,43 @@ T = TypeVar("T")
 
 # Groq, OpenRouter and Ollama adapters reject output budgets above 4096.
 MAX_OUTPUT_TOKENS = 4096
+
+CONFIRMED_ENV = "FAIR_CONFIRMED_FREE_PROVIDERS"
+
+# The key each recurring free-plan provider is configured with. Only used to
+# say which keys are sitting unused; FAIR decides what is eligible.
+_NEEDS_CONFIRMATION = {
+    "GEMINI_API_KEY": "google_gemini_api",
+    "GROQ_API_KEY": "groq",
+    "MISTRAL_API_KEY": "mistral",
+    "CLOUDFLARE_API_TOKEN": "cloudflare_workers_ai",
+}
+
+
+def confirmed_free_providers() -> set[str]:
+    """Provider ids the operator has confirmed, from FAIR_CONFIRMED_FREE_PROVIDERS."""
+    return {item.strip() for item in os.getenv(CONFIRMED_ENV, "").split(",") if item.strip()}
+
+
+def unconfirmed_keys() -> list[str]:
+    """Provider ids that have a key set and are not confirmed, so FAIR will skip them."""
+    confirmed = confirmed_free_providers()
+    return sorted(
+        provider_id for env_name, provider_id in _NEEDS_CONFIRMATION.items()
+        if (os.getenv(env_name) or "").strip() and provider_id not in confirmed
+    )
+
+
+def _confirmation_hint(provider_ids: list[str]) -> str | None:
+    if not provider_ids:
+        return None
+    listed = ",".join(provider_ids)
+    return (
+        f"A key is set for {', '.join(provider_ids)}, and FAIR is not using it. FAIR uses a "
+        f"recurring free-plan provider only once you confirm its account cannot be billed: "
+        f"add {CONFIRMED_ENV}={listed} to .env, and only if that is true. OpenRouter Free, "
+        f"Kilo Free and local Ollama need no confirmation."
+    )
 
 
 @dataclass
@@ -93,6 +141,13 @@ class FairClient:
         }
         if self.timeout is not None:
             kwargs["timeout_seconds"] = self.timeout
+        # FAIR's embedded constructor reads the provider keys from the
+        # environment and not the confirmation that goes with them (its
+        # service does that itself). Without this a Gemini or Groq key could
+        # never bring FAIR up through CIP, whatever .env said.
+        confirmed = confirmed_free_providers()
+        if confirmed:
+            kwargs["confirmed_free_providers"] = confirmed
         return FAIR(**kwargs)
 
     def solve(
@@ -135,7 +190,15 @@ class FairClient:
         )
 
     def status(self) -> dict[str, Any]:
-        base = {"client_id": self.client_id, "providers": []}
+        """
+        {available, client_id, providers[], skipped{}, hint, error}.
+
+        skipped maps each provider FAIR was configured with and is not
+        using to its reason. hint is set when a key is present for a
+        provider that needs confirming: FAIR's own error for that case does
+        not say which key, or where the confirmation goes.
+        """
+        base = {"client_id": self.client_id, "providers": [], "skipped": {}, "hint": None}
         try:
             fair = self._build()
         except ImportError:
@@ -145,8 +208,13 @@ class FairClient:
                 "error": "fair package not installed — pip install \"cip[fair]\"",
             }
         except Exception as exc:
-            return {**base, "available": False, "error": str(exc)}
-        return {**base, "available": True, "providers": fair.providers(), "error": None}
+            return {**base, "available": False, "error": str(exc),
+                    "hint": _confirmation_hint(unconfirmed_keys())}
+        return {
+            **base, "available": True, "providers": fair.providers(), "error": None,
+            "skipped": {str(k): str(v) for k, v in (getattr(fair, "skipped", None) or {}).items()},
+            "hint": _confirmation_hint(unconfirmed_keys()),
+        }
 
     def is_available(self) -> bool:
         return self.status()["available"]

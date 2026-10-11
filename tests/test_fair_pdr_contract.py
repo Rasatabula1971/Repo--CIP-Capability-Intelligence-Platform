@@ -171,9 +171,27 @@ class TestTheTerminal:
         client = MagicMock(spec=FairClient)
         client.status.return_value = {
             "available": False, "client_id": "cip", "error": "no provider keys\nFAIR: ONLINE",
-            "providers": [{"provider_id": "groq", "status": "ACTIVE", "models": ["a", "b"]}]}
+            "providers": [{"provider_id": "groq", "status": "ACTIVE", "models": ["a", "b"]}],
+            "skipped": {"mistral": "confirmation required\nFAIR: ONLINE"},
+            "hint": "A key is set for mistral.\nFAIR: ONLINE"}
         monkeypatch.setattr(fc, "FairClient", lambda *a, **k: client)
         assert cli.main(["fair-status"]) == 0
         rows = capsys.readouterr().out.splitlines()
         assert rows == ["FAIR: OFFLINE", "  Client: cip",
-                        "  Reason: no provider keys FAIR: ONLINE", "  groq: ACTIVE (a, b)"]
+                        "  Reason: no provider keys FAIR: ONLINE", "  groq: ACTIVE (a, b)",
+                        "  mistral: NOT USED (confirmation required FAIR: ONLINE)",
+                        "  Hint: A key is set for mistral. FAIR: ONLINE"]
+
+    def test_fair_status_does_not_claim_a_key_works(self, monkeypatch, capsys):
+        """ONLINE means FAIR has somewhere to route. No request was sent."""
+        import integrations.fair_client as fc
+        client = MagicMock(spec=FairClient)
+        client.status.return_value = {
+            "available": True, "client_id": "cip", "error": None, "skipped": {}, "hint": None,
+            "providers": [{"provider_id": "openrouter_free", "status": "ACTIVE", "models": ["m"]}]}
+        monkeypatch.setattr(fc, "FairClient", lambda *a, **k: client)
+        assert cli.main(["fair-status"]) == 0
+        rows = capsys.readouterr().out.splitlines()
+        assert rows == ["FAIR: ONLINE", "  Client: cip", "  openrouter_free: ACTIVE (m)",
+                        "  Configured. No request was sent, so a key is not proven until a "
+                        "call succeeds."]
