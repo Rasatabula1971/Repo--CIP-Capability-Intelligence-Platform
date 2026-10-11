@@ -1741,6 +1741,19 @@ def import_requirements(
         cur.execute("SELECT id FROM project WHERE id = %s", (proj_uuid,))
         if cur.fetchone() is None:
             return None
+        # A project with a PDR is run by the PDR-to-Build workflow, where a
+        # requirement has a quote, limits, acceptance criteria and a human
+        # confirmation, and rewriting one resets its evidence. This tool
+        # predates all of that and writes the same rows with none of it.
+        cur.execute(
+            "SELECT 1 FROM requirement_source WHERE project_id = %s LIMIT 1", (proj_uuid,),
+        )
+        if cur.fetchone() is not None:
+            return {
+                "error": "this project is managed by the PDR-to-Build workflow; use "
+                         "record_requirements and record_capability_needs",
+                "created": 0, "updated": 0,
+            }
 
     try:
         parsed = parse_requirements_yaml(yaml_text)
@@ -2142,6 +2155,24 @@ def authorize_build(
         return {"error": "authorized_by must be non-empty"}
     if not reason or not reason.strip():
         return {"error": "reason must be non-empty"}
+
+    # A capability need in the PDR-to-Build workflow is authorised by the
+    # architecture lock, in the name of the human who approved it. This
+    # tool takes a free-text actor, so it must not be a way around that.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pr.kind FROM recommendation r "
+            "JOIN project_requirement pr ON pr.id = r.project_requirement_id "
+            "WHERE r.id = %s",
+            (rec_uuid,),
+        )
+        kind_row = cur.fetchone()
+    if kind_row and kind_row[0] == "capability_need":
+        return {
+            "error": "this recommendation belongs to a capability need in the "
+                     "PDR-to-Build workflow; it is authorised by lock_architecture "
+                     "under a recorded human approval, not by authorize_build"
+        }
 
     try:
         auth_id = _authorize(

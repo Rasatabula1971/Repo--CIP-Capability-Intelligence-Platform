@@ -467,7 +467,9 @@ def main():
     errors = []
     try:
         for e in EVALS:
-            result = record_evaluation(conn, **e)
+            # These evaluations predate evidence_depth. Their depth is not
+            # known, so it is left unrecorded rather than guessed.
+            result = record_evaluation(conn, **e, allow_legacy=True)
             if "error" in result:
                 errors.append((e["asset_slug"], result["error"]))
                 print(f"  FAIL  {e['asset_slug']}: {result['error']}")
