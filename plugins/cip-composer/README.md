@@ -9,6 +9,9 @@ in one step, no manual `claude mcp add`.
 - **`skills/cip-composer/SKILL.md`** — teaches Claude when to invoke CIP
   and how to hold the conversation (direct/dry voice, pressure-test the
   premise, honest gap-flagging).
+- **`skills/cip-pdr-build/SKILL.md`** — the PDR-to-Build workflow: how to
+  drive a build from a PDR through CIP's gates, what to do on a refusal,
+  and the rule that the agent never approves anything.
 - **`.claude-plugin/plugin.json`** — declares the `cip` MCP server as a
   stdio process running `cip-mcp`, so `/plugin install` wires both the
   skill and the tools in one action.

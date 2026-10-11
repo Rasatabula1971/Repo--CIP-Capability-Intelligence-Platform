@@ -14,7 +14,8 @@ Repo--CIP-Capability-Intelligence-Platform/
 │   ├── scoring/         Deterministic evidence-based scoring (Step 9)
 │   ├── policy/          Gates, constraints, compatibility (Step 10 + Phase 4/5a)
 │   ├── judgment/        Model-provider abstraction (Step 7)
-│   └── project/         Requirements, fit evaluation, recommendations
+│   ├── project/         Requirements, fit evaluation, recommendations
+│   └── pdr/             PDR-to-Build rules (pure): spans, decisions, lock, tasks, coverage
 ├── connectors/          Source ecosystems (GitHub, MCP, fake/test)
 ├── analysis/            Static analysis + evidence extractors
 ├── workers/             Queue consumers for the Step 0-13 workflow engine
@@ -27,8 +28,8 @@ Repo--CIP-Capability-Intelligence-Platform/
 │   ├── compose/         suggest_pipeline + scaffold_pipeline (Phase 5)
 │   └── bootstrap.py     One-command DB setup (create + migrate)
 ├── plugins/cip-composer/ Claude plugin (skill + MCP server bundle)
-├── db/migrations/       18 SQL migrations, applied in order, checksum-tracked
-├── tests/               512 tests, pytest
+├── db/migrations/       Numbered SQL migrations, applied in order, checksum-tracked
+├── tests/               pytest suite, against a real Postgres
 └── docs/                This file, cadence doc, install doc, WHAT_IS_CIP
 ```
 
@@ -93,6 +94,36 @@ safe to re-run or cron.
   matrix (`NATIVE_INTEROP`, `BRIDGEABLE`) plus I/O-type comparison,
   returning `compatible` \| `adapter_needed` \| `incompatible` with an
   adapter hint string.
+
+### PDR-to-Build workflow (spec v1.1, migrations 028 + 030)
+
+Full specification: [`pdr_to_build_spec_v1_1.md`](pdr_to_build_spec_v1_1.md).
+
+The split is the same as Step 12's: pure rules in `core/pdr/`, fact
+loading in `mcp_server/pdr_store.py`, sequencing and transactions in
+`mcp_server/pdr_queries.py`, approvals in `mcp_server/pdr_approvals.py`.
+
+| Table | Role |
+|---|---|
+| `requirement_source` | The PDR text, its hash and the source file's hash; the most recently activated one is current |
+| `project_requirement` | PDR requirements and capability needs, told apart by `kind` |
+| `requirement_need_link` | Which needs satisfy which requirements (N:M) |
+| `acceptance_criterion` | One row per criterion |
+| `requirement_search` | Append-only log of every search, including empty ones; whether it hit its ceiling, and a fingerprint of the registry and the evaluation store at the time |
+| `decision_record` | Append-only log of every decision and who made it |
+| `approval_request` / `approval` | Human gates, bound to a content hash and to the approval, lock version, lock request and scope confirmation they follow |
+| `architecture_lock` | Versioned, immutable snapshot of what was approved; usable only while its scope is the confirmed scope |
+| `build_task` / `build_task_requirement` | Work items, created only through the build gate |
+| `requirement_verification` | Evidence per criterion; latest wins, by insertion order; a pass counts while the task that recorded it is live, a fail stands |
+| `audit_event` | Append-only trail of the workflow, in the order written (`seq`); refusals, overwritten evaluations and dropped evidence included |
+
+`recommendation` and `build_authorization` (Steps 12 and 13) are reused
+as they are. `workers.recommend` gained `preview_recommendation` so a
+verdict can be computed without replacing the recommendation row. Its
+candidate loader is the one place that decides what the fit matcher is
+given: evidence on the pinned revision only, identified licenses only,
+and interface and dependency evidence whether or not promotion linked it
+to the version.
 
 ## Ingesters (`scripts/ingest/`)
 
@@ -186,7 +217,9 @@ the chain; CIP assembles the parts and documents the seams.
 
 ## MCP surface (`mcp_server/`)
 
-FastMCP-based stdio server (`cip-mcp` console script). Seven tools:
+FastMCP-based stdio server (`cip-mcp` console script). The original
+seven tools are below; later phases added many more, including the
+thirteen PDR-to-Build tools (see `mcp_server/README.md`):
 
 | Tool | Backing query |
 |---|---|
@@ -243,10 +276,10 @@ installable via `claude plugin marketplace add <path-or-git-url>`.
   low-confidence answers are retained specifically so re-runs don't
   re-ask the same question.
 
-## Current live state (as of this doc)
+## Registry state when this section was last measured
 
-- 18 migrations applied.
-- 512 tests passing.
+These figures predate the PDR-to-Build work and are kept for context.
+
 - 448 real components in the registry: 400 repos, 30 skills, 14
   libraries, 2 MCP tools, 1 agent, 1 workflow template.
 - Ingested from: targeted GitHub searches, `ad-si/awesome-video-production`,
