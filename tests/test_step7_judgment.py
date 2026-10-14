@@ -172,7 +172,7 @@ def test_gemini_401_becomes_blocked():
         return httpx.Response(401, json={"error": "bad key"})
     g = _gemini_with_transport(handler)
     with pytest.raises(BlockedProviderError):
-        g.invoke("gemini-2.5-flash", "hello")
+        g.invoke("gemini-3.8-flash", "hello")
 
 
 def test_gemini_500_becomes_transient():
@@ -182,7 +182,7 @@ def test_gemini_500_becomes_transient():
         return httpx.Response(500, text="internal error")
     g = _gemini_with_transport(handler)
     with pytest.raises(TransientProviderError):
-        g.invoke("gemini-2.5-flash", "hello")
+        g.invoke("gemini-3.8-flash", "hello")
 
 
 def test_gemini_429_becomes_transient():
@@ -192,7 +192,7 @@ def test_gemini_429_becomes_transient():
         return httpx.Response(429, text="rate limited")
     g = _gemini_with_transport(handler)
     with pytest.raises(TransientProviderError):
-        g.invoke("gemini-2.5-flash", "hello")
+        g.invoke("gemini-3.8-flash", "hello")
 
 
 def test_gemini_missing_api_key_is_blocked():
@@ -202,7 +202,7 @@ def test_gemini_missing_api_key_is_blocked():
         raise AssertionError("should never reach the wire")
     g = _gemini_with_transport(handler)
     with pytest.raises(BlockedProviderError, match="GEMINI_API_KEY is unset"):
-        g.invoke("gemini-2.5-flash", "hello")
+        g.invoke("gemini-3.8-flash", "hello")
 
 
 def test_gemini_extracts_text_and_tokens_from_envelope():
@@ -217,7 +217,7 @@ def test_gemini_extracts_text_and_tokens_from_envelope():
             },
         })
     g = _gemini_with_transport(handler)
-    r = g.invoke("gemini-2.5-flash", "prompt")
+    r = g.invoke("gemini-3.8-flash", "prompt")
     assert r.raw_text == "hello world"
     assert r.tokens_input == 42
     assert r.tokens_output == 8
@@ -231,7 +231,7 @@ def test_gemini_malformed_envelope_is_input_error():
         return httpx.Response(200, json={"candidates": []})
     g = _gemini_with_transport(handler)
     with pytest.raises(InputProviderError):
-        g.invoke("gemini-2.5-flash", "prompt")
+        g.invoke("gemini-3.8-flash", "prompt")
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +244,7 @@ def test_load_config_parses_stock_yaml():
     assert cfg[0].name == "gemini"
     assert cfg[0].tier == "free_primary"
     assert cfg[0].api_key_env == "GEMINI_API_KEY"
-    assert any(m["id"] == "gemini-2.5-flash" for m in cfg[0].models)
+    assert any(m["id"] == "gemini-3.8-flash" for m in cfg[0].models)
 
 
 def test_upsert_creates_provider_and_profile_rows(conn):
@@ -270,7 +270,7 @@ def test_upsert_creates_provider_and_profile_rows(conn):
             "WHERE pr.name = 'gemini'"
         )
         rows = cur.fetchall()
-    assert ("gemini-2.5-flash", True) in rows
+    assert ("gemini-3.8-flash", True) in rows
 
 
 def test_upsert_is_idempotent(conn):
@@ -358,7 +358,7 @@ def registry_and_snapshot(conn):
         gemini_db_id = cur.fetchone()[0]
         cur.execute(
             "INSERT INTO model_profile (provider_id, model_id, tool_calling) "
-            "VALUES (%s, 'gemini-2.5-flash', true) RETURNING id",
+            "VALUES (%s, 'gemini-3.8-flash', true) RETURNING id",
             (gemini_db_id,),
         )
     conn.commit()
@@ -407,7 +407,7 @@ def test_judgment_records_request_with_prompt_version_and_hash(
         prompt_name="capability_summary",
         context=_judgment_context(),
         provider_name="gemini",
-        model_id="gemini-2.5-flash",
+        model_id="gemini-3.8-flash",
     )
     assert outcome.schema_valid is True
     assert outcome.judgment is not None
@@ -435,7 +435,7 @@ def test_judgment_records_evidence_refs_used(conn, registry_and_snapshot):
         prompt_name="capability_summary",
         context=_judgment_context(refs=[str(ev1), str(ev2)]),
         provider_name="gemini",
-        model_id="gemini-2.5-flash",
+        model_id="gemini-3.8-flash",
         input_evidence_ids=[ev1, ev2],
     )
     with conn.cursor() as cur:
@@ -462,7 +462,7 @@ def test_valid_response_persists_parsed_fields(conn, registry_and_snapshot):
         prompt_name="capability_summary",
         context=_judgment_context(),
         provider_name="gemini",
-        model_id="gemini-2.5-flash",
+        model_id="gemini-3.8-flash",
     )
     with conn.cursor() as cur:
         cur.execute(
@@ -506,7 +506,7 @@ def test_malformed_response_persists_invalid_row_and_does_not_retry(
         prompt_name="capability_summary",
         context=_judgment_context(),
         provider_name="gemini",
-        model_id="gemini-2.5-flash",
+        model_id="gemini-3.8-flash",
     )
 
     # Exactly ONE model call.
@@ -553,7 +553,7 @@ def test_missing_field_in_response_persists_invalid_no_retry(
         prompt_name="capability_summary",
         context=_judgment_context(),
         provider_name="gemini",
-        model_id="gemini-2.5-flash",
+        model_id="gemini-3.8-flash",
     )
     assert outcome.schema_valid is False
     assert len(rig["fake_provider"].calls) == 1
@@ -579,7 +579,7 @@ def test_transient_provider_error_records_and_reraises(
             prompt_name="capability_summary",
             context=_judgment_context(),
             provider_name="gemini",
-            model_id="gemini-2.5-flash",
+            model_id="gemini-3.8-flash",
         )
     with conn.cursor() as cur:
         cur.execute(
@@ -605,7 +605,7 @@ def test_blocked_provider_error_records_policy_class(
             prompt_name="capability_summary",
             context=_judgment_context(),
             provider_name="gemini",
-            model_id="gemini-2.5-flash",
+            model_id="gemini-3.8-flash",
         )
     with conn.cursor() as cur:
         cur.execute("SELECT error_class FROM judgment_error")
@@ -644,7 +644,7 @@ def test_provider_reliability_is_queryable(conn, registry_and_snapshot):
             prompt_name="capability_summary",
             context=_judgment_context(),
             provider_name="gemini",
-            model_id="gemini-2.5-flash",
+            model_id="gemini-3.8-flash",
         )
 
     with conn.cursor() as cur:
